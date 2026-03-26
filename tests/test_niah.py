@@ -1,12 +1,12 @@
-"""Tests for scripts/niah_test.py — NIAH (Needle-In-A-Haystack) test runner.
+"""Tests for scripts/niah_test.py — NIAH (Needle-In-A-Haystack) test runner v2.
 
-Mocks ALL subprocess and HTTP calls so no llama-server is needed.
+Kamradt / RULER methodology. Mocks ALL subprocess and HTTP calls so no
+llama-server is needed.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import io
 import json
 import os
 import random
@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from unittest import mock
-from unittest.mock import MagicMock, PropertyMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -39,185 +39,518 @@ with patch("atexit.register"), patch("signal.signal"):
 
 
 # ===================================================================
-# Needle generation
+# Filler text generation
 # ===================================================================
 
 
-class TestGenerateNeedles:
-    """Tests for generate_needles()."""
+class TestBuildFiller:
+    """Tests for _build_filler()."""
 
-    def test_determinism_seed42(self):
-        """Same seed always produces identical needles."""
-        rng1 = random.Random(42)
-        rng2 = random.Random(42)
-        n1 = niah.generate_needles(5, rng1)
-        n2 = niah.generate_needles(5, rng2)
-        for a, b in zip(n1, n2):
-            assert a.city == b.city
-            assert a.code == b.code
-            assert a.position == b.position
-
-    def test_single_needle_at_midpoint(self):
-        """Single needle should be placed at position 0.5."""
+    def test_reaches_target_size(self):
+        """Filler paragraphs should reach the target character count."""
         rng = random.Random(42)
-        needles = niah.generate_needles(1, rng)
-        assert len(needles) == 1
-        assert needles[0].position == 0.5
-        assert needles[0].city == "Paris"
+        paragraphs = niah._build_filler(4000, rng)
+        total = sum(len(p) for p in paragraphs) + 2 * (len(paragraphs) - 1)
+        assert total >= 4000
 
-    def test_count_matches_request(self):
+    def test_diverse_topics(self):
+        """Paragraphs should be shuffled — first paragraph shouldn't always be the same."""
+        rng1 = random.Random(1)
+        rng2 = random.Random(99)
+        p1 = niah._build_filler(2000, rng1)
+        p2 = niah._build_filler(2000, rng2)
+        # Different seeds should shuffle differently
+        assert p1[0] != p2[0]
+
+    def test_not_repetitive_within_24(self):
+        """First 24 paragraphs should all be unique (no repeats in one cycle)."""
         rng = random.Random(42)
-        for count in [1, 3, 5, 10]:
-            needles = niah.generate_needles(count, rng)
-            assert len(needles) == count
-
-    def test_codes_in_valid_range(self):
-        rng = random.Random(42)
-        needles = niah.generate_needles(10, rng)
-        for n in needles:
-            assert 100000 <= n.code <= 999999
-
-    def test_positions_distributed_for_multiple(self):
-        """Multiple needles should span 5% to 95% of context."""
-        rng = random.Random(42)
-        needles = niah.generate_needles(5, rng)
-        # 5 needles: 0.05, 0.275, 0.5, 0.725, 0.95
-        expected_positions = [0.05 + (0.90 * i / 4) for i in range(5)]
-        for n, ep in zip(needles, expected_positions):
-            assert abs(n.position - ep) < 1e-9
-
-    def test_sentence_format(self):
-        rng = random.Random(42)
-        needles = niah.generate_needles(1, rng)
-        n = needles[0]
-        assert n.sentence == f"The secret code for {n.city} is {n.code}."
-
-
-# ===================================================================
-# Haystack generation
-# ===================================================================
-
-
-class TestGenerateHaystack:
-    """Tests for generate_haystack()."""
-
-    def test_filler_reaches_target_chars(self):
-        """Haystack should be at least target_chars long."""
-        rng = random.Random(42)
-        needles = niah.generate_needles(1, rng)
-        target = 4000
-        haystack = niah.generate_haystack(needles, target)
-        # The haystack includes needles + filler, should meet or exceed target
-        assert len(haystack) >= target
-
-    def test_needle_text_present(self):
-        """Every needle sentence must appear in the haystack."""
-        rng = random.Random(42)
-        needles = niah.generate_needles(3, rng)
-        haystack = niah.generate_haystack(needles, 8000)
-        for n in needles:
-            assert n.sentence in haystack
-
-    def test_multiple_needles_all_present(self):
-        rng = random.Random(42)
-        needles = niah.generate_needles(10, rng)
-        haystack = niah.generate_haystack(needles, 20000)
-        for n in needles:
-            assert n.sentence in haystack
-
-    def test_empty_needles(self):
-        """Haystack with no needles should just be filler."""
-        haystack = niah.generate_haystack([], 2000)
-        assert len(haystack) >= 2000
+        paragraphs = niah._build_filler(50000, rng)
+        # The first 24 should all be unique (24 = len(FILLER_PARAGRAPHS))
+        first_cycle = paragraphs[:24]
+        assert len(set(first_cycle)) == 24
 
     def test_small_target(self):
-        """Even a very small target should produce valid output."""
+        """Even a small target should produce at least one paragraph."""
         rng = random.Random(42)
-        needles = niah.generate_needles(1, rng)
-        haystack = niah.generate_haystack(needles, 100)
-        assert needles[0].sentence in haystack
+        paragraphs = niah._build_filler(10, rng)
+        assert len(paragraphs) >= 1
 
 
 # ===================================================================
-# Scoring
+# Magic number generation
 # ===================================================================
 
 
-class TestScoreResponse:
-    """Tests for score_response()."""
+class TestMakeMagicNumber:
+    """Tests for _make_magic_number()."""
+
+    def test_seven_digits(self):
+        rng = random.Random(42)
+        num = niah._make_magic_number(rng)
+        assert len(num) == 7
+        assert num.isdigit()
+
+    def test_range(self):
+        rng = random.Random(42)
+        for _ in range(100):
+            num = niah._make_magic_number(rng)
+            assert 1000000 <= int(num) <= 9999999
+
+    def test_deterministic(self):
+        assert niah._make_magic_number(random.Random(42)) == niah._make_magic_number(random.Random(42))
+
+
+# ===================================================================
+# Needle data class
+# ===================================================================
+
+
+class TestNeedle:
+    """Tests for the Needle dataclass."""
+
+    def test_sentence_format(self):
+        n = niah.Needle(key="The special magic number is", value="1234567", depth_pct=0.5)
+        assert n.sentence == "The special magic number is: 1234567."
+
+    def test_custom_key(self):
+        n = niah.Needle(key="The secret password is", value="9999999", depth_pct=0.0)
+        assert n.sentence == "The secret password is: 9999999."
+
+
+# ===================================================================
+# Needle generation & depth positions
+# ===================================================================
+
+
+class TestNeedleGeneration:
+    """Tests for needle construction patterns used across modes."""
+
+    def test_single_mode_needle_depth(self):
+        """Single mode creates a needle at depth_pct / 100."""
+        depth_pct = 50
+        needle = niah.Needle(
+            key="The special magic number is",
+            value=niah._make_magic_number(random.Random(42)),
+            depth_pct=depth_pct / 100.0,
+        )
+        assert needle.depth_pct == 0.5
+
+    def test_multi_key_distractor_positions(self):
+        """Distractors should be spread across 0-1 range."""
+        num_distractors = 5
+        positions = [(i + 1) / (num_distractors + 2) for i in range(num_distractors)]
+        # All positions should be between 0 and 1 exclusive
+        for p in positions:
+            assert 0.0 < p < 1.0
+        # Positions should be monotonically increasing
+        for i in range(len(positions) - 1):
+            assert positions[i] < positions[i + 1]
+
+    def test_multi_value_positions(self):
+        """Multi-value needles should be evenly spread."""
+        vc = 4
+        positions = [(i + 1) / (vc + 1) for i in range(vc)]
+        assert len(positions) == 4
+        for p in positions:
+            assert 0.0 < p < 1.0
+
+
+# ===================================================================
+# Distractor generation (multi-key mode)
+# ===================================================================
+
+
+class TestDistractors:
+    """Tests for distractor needle generation in multi-key mode."""
+
+    def test_distractor_keys_from_list(self):
+        """Distractors should use DISTRACTOR_KEYS."""
+        rng = random.Random(42)
+        num_distractors = 3
+        distractors = []
+        for i in range(num_distractors):
+            d_key = niah.DISTRACTOR_KEYS[i % len(niah.DISTRACTOR_KEYS)]
+            distractors.append(niah.Needle(
+                key=d_key,
+                value=niah._make_magic_number(rng),
+                depth_pct=(i + 1) / (num_distractors + 2),
+            ))
+        assert len(distractors) == 3
+        assert distractors[0].key == "The secret password is"
+        assert distractors[1].key == "The hidden code is"
+        assert distractors[2].key == "The encrypted token is"
+
+    def test_distractor_values_are_7_digit(self):
+        rng = random.Random(42)
+        for i in range(5):
+            val = niah._make_magic_number(rng)
+            assert len(val) == 7
+            assert val.isdigit()
+
+    def test_distractor_key_wraps(self):
+        """With more distractors than keys, should wrap around."""
+        num_keys = len(niah.DISTRACTOR_KEYS)
+        key = niah.DISTRACTOR_KEYS[(num_keys + 2) % num_keys]
+        assert key == niah.DISTRACTOR_KEYS[2]
+
+
+# ===================================================================
+# Scoring — 7-digit exact match
+# ===================================================================
+
+
+class TestScoreSingle:
+    """Tests for _score_single()."""
 
     def test_exact_match(self):
-        assert niah.score_response("123456", 123456) is True
+        assert niah._score_single("1234567", "1234567") is True
 
     def test_code_in_sentence(self):
-        """Code embedded in a sentence should still match."""
-        assert niah.score_response("The code is 654321, I think.", 654321) is True
+        assert niah._score_single("The number is 1234567, I think.", "1234567") is True
 
     def test_no_match(self):
-        assert niah.score_response("I don't know", 123456) is False
+        assert niah._score_single("I don't know", "1234567") is False
 
-    def test_partial_match_fails(self):
-        """A partial digit overlap shouldn't count (unless substring matches)."""
-        # 12345 is a substring of 123456, but we're looking for 123456
-        assert niah.score_response("12345", 123456) is False
+    def test_reject_6_digit(self):
+        """6-digit number should NOT match a 7-digit expected value."""
+        assert niah._score_single("123456", "1234567") is False
+
+    def test_reject_partial(self):
+        """Partial overlap should not match."""
+        assert niah._score_single("1234568", "1234567") is False
+
+    def test_reject_8_digit_containing_7(self):
+        """An 8-digit number that contains the 7-digit code shouldn't match (word boundary)."""
+        assert niah._score_single("12345678", "1234567") is False
 
     def test_empty_response(self):
-        assert niah.score_response("", 123456) is False
+        assert niah._score_single("", "1234567") is False
 
     def test_garbage_response(self):
-        assert niah.score_response("asdfghjkl!@#$%^", 999999) is False
+        assert niah._score_single("asdfghjkl!@#$%^", "9999999") is False
 
     def test_number_with_extra_text(self):
-        assert niah.score_response("Sure! The answer is 555123.", 555123) is True
+        assert niah._score_single("Sure! The answer is 5551234.", "5551234") is True
 
     def test_repeated_wrong_numbers(self):
-        assert niah.score_response("111111 222222 333333", 444444) is False
+        assert niah._score_single("1111111 2222222 3333333", "4444444") is False
 
 
 # ===================================================================
-# Data classes
+# Multi-value scoring
+# ===================================================================
+
+
+class TestScoreMultiValue:
+    """Tests for _score_multi_value()."""
+
+    def test_all_found(self):
+        result = niah._score_multi_value("1234567, 7654321, 1111111", ["1234567", "7654321", "1111111"])
+        assert result == [True, True, True]
+
+    def test_partial_found(self):
+        result = niah._score_multi_value("1234567 and something", ["1234567", "7654321"])
+        assert result == [True, False]
+
+    def test_none_found(self):
+        result = niah._score_multi_value("no numbers here", ["1234567", "7654321"])
+        assert result == [False, False]
+
+    def test_rejects_6_digit_in_multi(self):
+        """6-digit numbers should not match 7-digit expected values."""
+        result = niah._score_multi_value("123456", ["1234567"])
+        assert result == [False]
+
+
+# ===================================================================
+# Haystack assembly — single mode
+# ===================================================================
+
+
+class TestGenerateHaystackSingle:
+    """Tests for generate_haystack_single()."""
+
+    def test_needle_text_present(self):
+        rng = random.Random(42)
+        needle = niah.Needle(key="The special magic number is", value="1234567", depth_pct=0.5)
+        haystack = niah.generate_haystack_single(needle, 4000, rng)
+        assert needle.sentence in haystack
+
+    def test_reaches_target_size(self):
+        rng = random.Random(42)
+        needle = niah.Needle(key="The special magic number is", value="1234567", depth_pct=0.5)
+        haystack = niah.generate_haystack_single(needle, 4000, rng)
+        assert len(haystack) >= 4000
+
+    def test_needle_at_start(self):
+        """Depth 0% should place needle near the beginning."""
+        rng = random.Random(42)
+        needle = niah.Needle(key="The special magic number is", value="1234567", depth_pct=0.0)
+        haystack = niah.generate_haystack_single(needle, 4000, rng)
+        assert needle.sentence in haystack
+        # Should appear in the first quarter
+        pos = haystack.index(needle.sentence)
+        assert pos < len(haystack) * 0.25
+
+    def test_needle_at_end(self):
+        """Depth 100% should place needle near the end."""
+        rng = random.Random(42)
+        needle = niah.Needle(key="The special magic number is", value="1234567", depth_pct=1.0)
+        haystack = niah.generate_haystack_single(needle, 4000, rng)
+        assert needle.sentence in haystack
+        pos = haystack.index(needle.sentence)
+        assert pos > len(haystack) * 0.5
+
+
+# ===================================================================
+# Haystack assembly — multi-key mode
+# ===================================================================
+
+
+class TestGenerateHaystackMultiKey:
+    """Tests for generate_haystack_multi_key()."""
+
+    def test_real_and_distractors_present(self):
+        rng = random.Random(42)
+        real = niah.Needle(key="The special magic number is", value="1234567", depth_pct=0.5)
+        distractors = [
+            niah.Needle(key="The secret password is", value="7654321", depth_pct=0.25),
+            niah.Needle(key="The hidden code is", value="1111111", depth_pct=0.75),
+        ]
+        haystack = niah.generate_haystack_multi_key(real, distractors, 4000, rng)
+        assert real.sentence in haystack
+        for d in distractors:
+            assert d.sentence in haystack
+
+
+# ===================================================================
+# Haystack assembly — multi-value mode
+# ===================================================================
+
+
+class TestGenerateHaystackMultiValue:
+    """Tests for generate_haystack_multi_value()."""
+
+    def test_all_needles_present(self):
+        rng = random.Random(42)
+        needles = [
+            niah.Needle(key="The special magic number is", value="1111111", depth_pct=0.25),
+            niah.Needle(key="The special magic number is", value="2222222", depth_pct=0.5),
+            niah.Needle(key="The special magic number is", value="3333333", depth_pct=0.75),
+        ]
+        haystack = niah.generate_haystack_multi_value(needles, 4000, rng)
+        for n in needles:
+            assert n.sentence in haystack
+
+
+# ===================================================================
+# Insert needles at correct depth
+# ===================================================================
+
+
+class TestInsertNeedlesIntoParas:
+    """Tests for _insert_needles_into_paragraphs()."""
+
+    def test_needle_at_depth_zero(self):
+        paragraphs = ["aaa", "bbb", "ccc", "ddd"]
+        needle = niah.Needle(key="KEY", value="1234567", depth_pct=0.0)
+        result = niah._insert_needles_into_paragraphs(paragraphs, [needle])
+        parts = result.split("\n\n")
+        assert parts[0] == needle.sentence
+
+    def test_needle_at_depth_100(self):
+        paragraphs = ["aaa", "bbb", "ccc", "ddd"]
+        needle = niah.Needle(key="KEY", value="1234567", depth_pct=1.0)
+        result = niah._insert_needles_into_paragraphs(paragraphs, [needle])
+        parts = result.split("\n\n")
+        assert parts[-1] == needle.sentence
+
+    def test_multiple_needles_at_different_depths(self):
+        paragraphs = ["aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg", "hhh", "iii", "jjj"]
+        n1 = niah.Needle(key="K1", value="1111111", depth_pct=0.0)
+        n2 = niah.Needle(key="K2", value="2222222", depth_pct=1.0)
+        result = niah._insert_needles_into_paragraphs(paragraphs, [n1, n2])
+        parts = result.split("\n\n")
+        assert parts[0] == n1.sentence
+        assert parts[-1] == n2.sentence
+
+
+# ===================================================================
+# Data classes — ConfigResult, TrialResult
 # ===================================================================
 
 
 class TestDataClasses:
-    """Tests for Needle, TrialResult, ConfigResult."""
+    """Tests for ConfigResult and TrialResult."""
 
-    def test_needle_post_init(self):
-        n = niah.Needle(city="Berlin", code=111111, position=0.3)
-        assert n.sentence == "The secret code for Berlin is 111111."
-
-    def test_config_result_accuracy(self):
-        cr = niah.ConfigResult(depth=4096, needle_count=3, cache_type="q8_0")
+    def test_config_result_accuracy_pct(self):
+        cr = niah.ConfigResult(mode="single", context_length=4096, cache_type="q8_0")
         cr.trials = [
-            niah.TrialResult("Paris", 100000, "100000", True),
-            niah.TrialResult("Tokyo", 200000, "nope", False),
-            niah.TrialResult("Mumbai", 300000, "300000", True),
+            niah.TrialResult(expected="1111111", response="1111111", found=True),
+            niah.TrialResult(expected="2222222", response="nope", found=False),
+            niah.TrialResult(expected="3333333", response="3333333", found=True),
         ]
-        assert cr.accuracy == "2/3"
         assert abs(cr.accuracy_pct - 66.666) < 1.0
 
+    def test_config_result_passed_all_true(self):
+        cr = niah.ConfigResult(mode="single", context_length=4096, cache_type="q8_0")
+        cr.trials = [
+            niah.TrialResult(expected="1111111", response="1111111", found=True),
+            niah.TrialResult(expected="2222222", response="2222222", found=True),
+        ]
+        assert cr.passed is True
+
+    def test_config_result_passed_one_false(self):
+        cr = niah.ConfigResult(mode="single", context_length=4096, cache_type="q8_0")
+        cr.trials = [
+            niah.TrialResult(expected="1111111", response="1111111", found=True),
+            niah.TrialResult(expected="2222222", response="wrong", found=False),
+        ]
+        assert cr.passed is False
+
     def test_config_result_empty_trials(self):
-        cr = niah.ConfigResult(depth=4096, needle_count=0, cache_type="q8_0")
-        assert cr.accuracy == "0/0"
+        cr = niah.ConfigResult(mode="single", context_length=4096, cache_type="q8_0")
         assert cr.accuracy_pct == 0.0
+        assert cr.passed is True  # vacuously true (all() of empty)
 
     def test_config_result_all_hits(self):
-        cr = niah.ConfigResult(depth=4096, needle_count=2, cache_type="q8_0")
+        cr = niah.ConfigResult(mode="single", context_length=4096, cache_type="q8_0")
         cr.trials = [
-            niah.TrialResult("Paris", 100000, "100000", True),
-            niah.TrialResult("Tokyo", 200000, "200000", True),
+            niah.TrialResult(expected="1111111", response="1111111", found=True),
         ]
-        assert cr.accuracy == "2/2"
         assert cr.accuracy_pct == 100.0
 
-    def test_config_result_all_misses(self):
-        cr = niah.ConfigResult(depth=4096, needle_count=2, cache_type="q8_0")
-        cr.trials = [
-            niah.TrialResult("Paris", 100000, "wrong", False),
-            niah.TrialResult("Tokyo", 200000, "wrong", False),
+    def test_trial_result_defaults(self):
+        t = niah.TrialResult(expected="1234567", response="1234567", found=True)
+        assert t.needle_depth_pct == 0.0
+        assert t.context_length == 0
+
+
+# ===================================================================
+# Heatmap table generation (single mode)
+# ===================================================================
+
+
+class TestHeatmapTable:
+    """Tests for _build_heatmap_table()."""
+
+    def test_basic_heatmap(self):
+        results = [
+            niah.ConfigResult(mode="single", context_length=4096, cache_type="q8_0", needle_depth_pct=0.5),
         ]
-        assert cr.accuracy == "0/2"
-        assert cr.accuracy_pct == 0.0
+        results[0].trials = [niah.TrialResult(expected="1234567", response="1234567", found=True)]
+        table = niah._build_heatmap_table(results, "q8_0", "test-model")
+        assert "q8_0" in table
+        assert "50" in table  # depth 50%
+
+    def test_no_results(self):
+        table = niah._build_heatmap_table([], "q8_0", "test-model")
+        assert "no results" in table
+
+    def test_err_for_no_trials(self):
+        results = [
+            niah.ConfigResult(mode="single", context_length=4096, cache_type="q8_0", needle_depth_pct=0.5),
+        ]
+        # No trials — passed is vacuously True, but we still get a row
+        table = niah._build_heatmap_table(results, "q8_0", "test-model")
+        # Should have a row with depth 50%
+        assert "50" in table
+
+
+# ===================================================================
+# Delta table
+# ===================================================================
+
+
+class TestDeltaTable:
+    """Tests for _build_delta_table()."""
+
+    def test_delta_with_difference(self):
+        r1 = niah.ConfigResult(mode="single", context_length=4096, cache_type="q8_0", needle_depth_pct=0.5)
+        r1.trials = [niah.TrialResult(expected="1234567", response="1234567", found=True)]
+        r2 = niah.ConfigResult(mode="single", context_length=4096, cache_type="turbo3", needle_depth_pct=0.5)
+        r2.trials = [niah.TrialResult(expected="1234567", response="wrong", found=False)]
+        table = niah._build_delta_table([r1, r2], "q8_0", "turbo3")
+        assert "Delta" in table
+
+    def test_delta_empty_when_no_baseline(self):
+        table = niah._build_delta_table([], "q8_0", "turbo3")
+        assert table == ""
+
+
+# ===================================================================
+# Multi-key table
+# ===================================================================
+
+
+class TestMultiKeyTable:
+    """Tests for _build_multi_key_table()."""
+
+    def test_basic_multi_key_table(self):
+        r = niah.ConfigResult(mode="multi-key", context_length=4096, cache_type="q8_0", needle_depth_pct=0.5)
+        r.trials = [niah.TrialResult(expected="1234567", response="1234567", found=True)]
+        table = niah._build_multi_key_table([r], "test-model")
+        assert "Multi-Key" in table
+        assert "q8_0" in table
+
+
+# ===================================================================
+# Multi-value table
+# ===================================================================
+
+
+class TestMultiValueTable:
+    """Tests for _build_multi_value_table()."""
+
+    def test_basic_multi_value_table(self):
+        r = niah.ConfigResult(mode="multi-value", context_length=4096, cache_type="q8_0", needle_count=2)
+        r.trials = [
+            niah.TrialResult(expected="1111111", response="1111111, 2222222", found=True),
+            niah.TrialResult(expected="2222222", response="1111111, 2222222", found=True),
+        ]
+        table = niah._build_multi_value_table([r], "test-model")
+        assert "Multi-Value" in table
+
+
+# ===================================================================
+# build_output (all three modes)
+# ===================================================================
+
+
+class TestBuildOutput:
+    """Tests for build_output()."""
+
+    def test_single_mode(self):
+        r = niah.ConfigResult(mode="single", context_length=4096, cache_type="q8_0", needle_depth_pct=0.5)
+        r.trials = [niah.TrialResult(expected="1234567", response="1234567", found=True)]
+        output = niah.build_output([r], "test-model", "single")
+        assert "test-model" in output
+        assert "single" in output.lower()
+
+    def test_multi_key_mode(self):
+        r = niah.ConfigResult(mode="multi-key", context_length=4096, cache_type="q8_0")
+        r.trials = [niah.TrialResult(expected="1234567", response="1234567", found=True)]
+        output = niah.build_output([r], "test-model", "multi-key")
+        assert "Multi-Key" in output
+
+    def test_multi_value_mode(self):
+        r = niah.ConfigResult(mode="multi-value", context_length=4096, cache_type="q8_0", needle_count=2)
+        r.trials = [
+            niah.TrialResult(expected="1111111", response="1111111, 2222222", found=True),
+            niah.TrialResult(expected="2222222", response="1111111, 2222222", found=True),
+        ]
+        output = niah.build_output([r], "test-model", "multi-value")
+        assert "Multi-Value" in output
+
+    def test_single_mode_with_delta(self):
+        """Two cache types in single mode should produce a delta table."""
+        r1 = niah.ConfigResult(mode="single", context_length=4096, cache_type="q8_0", needle_depth_pct=0.5)
+        r1.trials = [niah.TrialResult(expected="1234567", response="1234567", found=True)]
+        r2 = niah.ConfigResult(mode="single", context_length=4096, cache_type="turbo3", needle_depth_pct=0.5)
+        r2.trials = [niah.TrialResult(expected="1234567", response="wrong", found=False)]
+        output = niah.build_output([r1, r2], "test-model", "single")
+        assert "Delta" in output
 
 
 # ===================================================================
@@ -229,13 +562,10 @@ class TestFindFreePort:
     """Tests for _find_free_port()."""
 
     def test_finds_port(self):
-        """Should find a free port without error."""
         port = niah._find_free_port(18000)
         assert 18000 <= port < 18100
 
     def test_port_conflict_skips_busy(self):
-        """If a port is occupied, it should skip to the next one."""
-        # Occupy a port
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("127.0.0.1", 19000))
             s.listen(1)
@@ -244,7 +574,6 @@ class TestFindFreePort:
             assert 19001 <= port < 19100
 
     def test_all_ports_busy_raises(self):
-        """If all ports in range are busy, should raise RuntimeError."""
         def always_busy(*args, **kwargs):
             s = MagicMock()
             s.__enter__ = MagicMock(return_value=s)
@@ -266,7 +595,6 @@ class TestStartServer:
     """Tests for start_server()."""
 
     def _make_health_response(self, status="ok"):
-        """Create a mock HTTP response for /health."""
         body = json.dumps({"status": status}).encode()
         resp = MagicMock()
         resp.read.return_value = body
@@ -284,7 +612,6 @@ class TestStartServer:
     @patch("urllib.request.urlopen")
     @patch("subprocess.Popen")
     def test_successful_startup(self, mock_popen, mock_urlopen, mock_sleep):
-        """Server starts and becomes healthy."""
         proc = self._make_proc()
         mock_popen.return_value = proc
         mock_urlopen.return_value = self._make_health_response("ok")
@@ -302,7 +629,6 @@ class TestStartServer:
     @patch("urllib.request.urlopen")
     @patch("subprocess.Popen")
     def test_server_binary_not_found(self, mock_popen, mock_urlopen, mock_sleep):
-        """Should raise FileNotFoundError if llama-server binary missing."""
         with tempfile.TemporaryDirectory() as td:
             with pytest.raises(FileNotFoundError, match="llama-server not found"):
                 niah.start_server(Path(td), Path("/fake/model.gguf"), "q8_0", 4096, 8090)
@@ -311,7 +637,6 @@ class TestStartServer:
     @patch("urllib.request.urlopen")
     @patch("subprocess.Popen")
     def test_server_exits_prematurely(self, mock_popen, mock_urlopen, mock_sleep):
-        """Should raise RuntimeError if server process exits during health check."""
         proc = self._make_proc(poll_return=1, returncode=1)
         mock_popen.return_value = proc
 
@@ -328,12 +653,9 @@ class TestStartServer:
     @patch("urllib.request.urlopen")
     @patch("subprocess.Popen")
     def test_server_health_timeout(self, mock_popen, mock_urlopen, mock_sleep, mock_monotonic):
-        """Should raise TimeoutError if health never returns ok."""
         proc = self._make_proc()
         mock_popen.return_value = proc
-
-        # Simulate time passing beyond the 120s deadline
-        mock_monotonic.side_effect = [0, 0, 121]  # start, first check, past deadline
+        mock_monotonic.side_effect = [0, 0, 121]
         mock_urlopen.side_effect = urllib.error.URLError("connection refused")
 
         with tempfile.TemporaryDirectory() as td:
@@ -348,11 +670,8 @@ class TestStartServer:
     @patch("urllib.request.urlopen")
     @patch("subprocess.Popen")
     def test_health_check_retries_on_url_error(self, mock_popen, mock_urlopen, mock_sleep):
-        """Server should retry health checks when connection is refused."""
         proc = self._make_proc()
         mock_popen.return_value = proc
-
-        # Fail twice, succeed third time
         mock_urlopen.side_effect = [
             urllib.error.URLError("refused"),
             urllib.error.URLError("refused"),
@@ -412,8 +731,8 @@ class TestCleanupServer:
 # ===================================================================
 
 
-class TestQueryNeedle:
-    """Tests for query_needle()."""
+class TestQueryServer:
+    """Tests for _query_server()."""
 
     def _make_chat_response(self, content: str):
         body = json.dumps({
@@ -428,125 +747,54 @@ class TestQueryNeedle:
     @patch("time.sleep")
     @patch("urllib.request.urlopen")
     def test_successful_query(self, mock_urlopen, mock_sleep):
-        mock_urlopen.return_value = self._make_chat_response("123456")
-        result = niah.query_needle(8090, "some haystack", "Paris")
-        assert result == "123456"
+        mock_urlopen.return_value = self._make_chat_response("1234567")
+        result = niah._query_server(8090, "some haystack")
+        assert result == "1234567"
 
     @patch("time.sleep")
     @patch("urllib.request.urlopen")
     def test_retries_on_network_error(self, mock_urlopen, mock_sleep):
-        """Should retry on URLError and succeed on final attempt."""
         mock_urlopen.side_effect = [
             urllib.error.URLError("timeout"),
             urllib.error.URLError("timeout"),
-            self._make_chat_response("654321"),
+            self._make_chat_response("6543210"),
         ]
-        result = niah.query_needle(8090, "haystack", "Tokyo", max_retries=3)
-        assert result == "654321"
+        result = niah._query_server(8090, "haystack", max_retries=3)
+        assert result == "6543210"
 
     @patch("time.sleep")
     @patch("urllib.request.urlopen")
     def test_all_retries_exhausted(self, mock_urlopen, mock_sleep):
-        """Should raise RuntimeError after exhausting all retries."""
         mock_urlopen.side_effect = urllib.error.URLError("timeout")
         with pytest.raises(RuntimeError, match="Failed to query server"):
-            niah.query_needle(8090, "haystack", "Paris", max_retries=3)
+            niah._query_server(8090, "haystack", max_retries=3)
 
     @patch("time.sleep")
     @patch("urllib.request.urlopen")
     def test_garbage_json_response(self, mock_urlopen, mock_sleep):
-        """Malformed JSON should raise RuntimeError."""
         resp = MagicMock()
         resp.read.return_value = b"not json at all"
         resp.__enter__ = MagicMock(return_value=resp)
         resp.__exit__ = MagicMock(return_value=False)
         mock_urlopen.return_value = resp
         with pytest.raises(RuntimeError, match="Unexpected response format"):
-            niah.query_needle(8090, "haystack", "Paris")
-
-    @patch("time.sleep")
-    @patch("urllib.request.urlopen")
-    def test_missing_choices_key(self, mock_urlopen, mock_sleep):
-        """Response missing 'choices' should raise RuntimeError."""
-        body = json.dumps({"error": "something"}).encode()
-        resp = MagicMock()
-        resp.read.return_value = body
-        resp.__enter__ = MagicMock(return_value=resp)
-        resp.__exit__ = MagicMock(return_value=False)
-        mock_urlopen.return_value = resp
-        with pytest.raises(RuntimeError, match="Unexpected response format"):
-            niah.query_needle(8090, "haystack", "Paris")
-
-    @patch("time.sleep")
-    @patch("urllib.request.urlopen")
-    def test_empty_choices_array(self, mock_urlopen, mock_sleep):
-        """Empty choices array should raise RuntimeError."""
-        body = json.dumps({"choices": []}).encode()
-        resp = MagicMock()
-        resp.read.return_value = body
-        resp.__enter__ = MagicMock(return_value=resp)
-        resp.__exit__ = MagicMock(return_value=False)
-        mock_urlopen.return_value = resp
-        with pytest.raises(RuntimeError, match="Unexpected response format"):
-            niah.query_needle(8090, "haystack", "Paris")
+            niah._query_server(8090, "haystack")
 
     @patch("time.sleep")
     @patch("urllib.request.urlopen")
     def test_response_stripped(self, mock_urlopen, mock_sleep):
-        """Whitespace should be stripped from response."""
-        mock_urlopen.return_value = self._make_chat_response("  123456  \n")
-        result = niah.query_needle(8090, "haystack", "Paris")
-        assert result == "123456"
+        mock_urlopen.return_value = self._make_chat_response("  1234567  \n")
+        result = niah._query_server(8090, "haystack")
+        assert result == "1234567"
 
-
-# ===================================================================
-# Table output formatting
-# ===================================================================
-
-
-class TestBuildTable:
-    """Tests for build_table()."""
-
-    def test_single_cache_type(self):
-        results = [
-            niah.ConfigResult(depth=4096, needle_count=1, cache_type="q8_0"),
-        ]
-        results[0].trials = [niah.TrialResult("Paris", 100000, "100000", True)]
-        table = niah.build_table(results, "test-model")
-        assert "test-model" in table
-        assert "4K" in table  # 4096 -> 4K
-        assert "q8_0" in table
-
-    def test_two_cache_types_with_delta(self):
-        r1 = niah.ConfigResult(depth=4096, needle_count=1, cache_type="q8_0")
-        r1.trials = [niah.TrialResult("Paris", 100000, "100000", True)]
-        r2 = niah.ConfigResult(depth=4096, needle_count=1, cache_type="turbo3")
-        r2.trials = [niah.TrialResult("Paris", 100000, "wrong", False)]
-        table = niah.build_table([r1, r2], "test-model")
-        assert "Delta" in table
-
-    def test_error_result_shows_err(self):
-        """Config with no trials should show ERR."""
-        r = niah.ConfigResult(depth=8192, needle_count=5, cache_type="q8_0")
-        # No trials added
-        table = niah.build_table([r], "test-model")
-        assert "ERR" in table
-
-    def test_sub_1024_depth_label(self):
-        """Depths < 1024 should show raw number, not K suffix."""
-        r = niah.ConfigResult(depth=512, needle_count=1, cache_type="q8_0")
-        r.trials = [niah.TrialResult("Paris", 100000, "100000", True)]
-        table = niah.build_table([r], "model")
-        assert "512" in table
-
-    def test_two_cache_types_delta_na_on_error(self):
-        """Delta should be N/A when one config has no trials."""
-        r1 = niah.ConfigResult(depth=4096, needle_count=1, cache_type="q8_0")
-        r1.trials = [niah.TrialResult("Paris", 100000, "100000", True)]
-        r2 = niah.ConfigResult(depth=4096, needle_count=1, cache_type="turbo3")
-        # r2 has no trials (error)
-        table = niah.build_table([r1, r2], "model")
-        assert "N/A" in table
+    @patch("time.sleep")
+    @patch("urllib.request.urlopen")
+    def test_thinking_tags_stripped(self, mock_urlopen, mock_sleep):
+        mock_urlopen.return_value = self._make_chat_response(
+            "<think>let me think...</think>1234567"
+        )
+        result = niah._query_server(8090, "haystack")
+        assert result == "1234567"
 
 
 # ===================================================================
@@ -558,32 +806,42 @@ class TestSaveResults:
     """Tests for save_results()."""
 
     def test_creates_json_and_md(self):
-        r = niah.ConfigResult(depth=4096, needle_count=1, cache_type="q8_0")
-        r.trials = [niah.TrialResult("Paris", 100000, "100000", True)]
+        r = niah.ConfigResult(mode="single", context_length=4096, cache_type="q8_0", needle_depth_pct=0.5)
+        r.trials = [niah.TrialResult(expected="1234567", response="1234567", found=True)]
 
         with tempfile.TemporaryDirectory() as td:
-            json_path, md_path = niah.save_results([r], "test-model", Path(td))
+            json_path, md_path = niah.save_results([r], "test-model", "single", Path(td))
             assert json_path.exists()
             assert md_path.exists()
             assert json_path.suffix == ".json"
             assert md_path.suffix == ".md"
 
-            # Verify JSON is valid
             with open(json_path) as f:
                 data = json.load(f)
             assert data["model"] == "test-model"
+            assert data["mode"] == "single"
             assert data["seed"] == 42
             assert len(data["results"]) == 1
 
     def test_creates_output_dir(self):
-        """Should create output directory if it doesn't exist."""
-        r = niah.ConfigResult(depth=4096, needle_count=1, cache_type="q8_0")
+        r = niah.ConfigResult(mode="single", context_length=4096, cache_type="q8_0")
         r.trials = []
 
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "nested" / "output"
-            niah.save_results([r], "model", out)
+            niah.save_results([r], "model", "single", out)
             assert out.exists()
+
+    def test_no_home_dir_in_output(self):
+        """Output paths should not contain /Users/tom/."""
+        r = niah.ConfigResult(mode="single", context_length=4096, cache_type="q8_0")
+        r.trials = [niah.TrialResult(expected="1234567", response="1234567", found=True)]
+
+        with tempfile.TemporaryDirectory() as td:
+            json_path, md_path = niah.save_results([r], "test-model", "single", Path(td))
+            with open(md_path) as f:
+                content = f.read()
+            assert "/Users/tom/" not in content
 
 
 # ===================================================================
@@ -606,15 +864,42 @@ class TestParseArgs:
     def test_defaults(self):
         args = niah.parse_args(["/llama"])
         assert args.depths == "4096,8192,16384,32768"
-        assert args.needles == "1,5,10"
+        assert args.mode == "single"
         assert args.port == "8090"
         assert args.cache_types == "q8_0,turbo3"
         assert args.verbose is False
         assert args.output_dir is None
+        assert args.num_distractors == 3
+        assert args.value_counts == "2,4,8"
+        assert args.depths_sweep == "0,10,20,30,40,50,60,70,80,90,100"
+        assert args.server_timeout == 120
+        assert args.query_timeout == 300
+        assert args.server_bin is None
+        assert args.chars_per_token == 4.0
 
-    def test_custom_depths(self):
-        args = niah.parse_args(["/llama", "--depths", "2048,4096"])
-        assert args.depths == "2048,4096"
+    def test_mode_single(self):
+        args = niah.parse_args(["/llama", "--mode", "single"])
+        assert args.mode == "single"
+
+    def test_mode_multi_key(self):
+        args = niah.parse_args(["/llama", "--mode", "multi-key"])
+        assert args.mode == "multi-key"
+
+    def test_mode_multi_value(self):
+        args = niah.parse_args(["/llama", "--mode", "multi-value"])
+        assert args.mode == "multi-value"
+
+    def test_depths_sweep(self):
+        args = niah.parse_args(["/llama", "--depths-sweep", "0,50,100"])
+        assert args.depths_sweep == "0,50,100"
+
+    def test_num_distractors(self):
+        args = niah.parse_args(["/llama", "--num-distractors", "5"])
+        assert args.num_distractors == 5
+
+    def test_value_counts(self):
+        args = niah.parse_args(["/llama", "--value-counts", "1,2,3"])
+        assert args.value_counts == "1,2,3"
 
     def test_verbose_flag(self):
         args = niah.parse_args(["/llama", "-v"])
@@ -623,228 +908,37 @@ class TestParseArgs:
     def test_all_options(self):
         args = niah.parse_args([
             "/llama", "/model.gguf",
+            "--mode", "multi-key",
             "--depths", "1024",
-            "--needles", "1,2",
-            "--port", "9090",
+            "--depths-sweep", "0,50,100",
             "--cache-types", "f16",
+            "--num-distractors", "7",
+            "--value-counts", "1,2",
+            "--port", "9090",
             "--output-dir", "/tmp/out",
             "--verbose",
+            "--server-timeout", "60",
+            "--query-timeout", "120",
+            "--server-bin", "/path/to/server",
+            "--chars-per-token", "3.5",
         ])
+        assert args.mode == "multi-key"
         assert args.depths == "1024"
-        assert args.needles == "1,2"
-        assert args.port == "9090"
+        assert args.depths_sweep == "0,50,100"
         assert args.cache_types == "f16"
+        assert args.num_distractors == 7
+        assert args.value_counts == "1,2"
+        assert args.port == "9090"
         assert args.output_dir == "/tmp/out"
         assert args.verbose is True
+        assert args.server_timeout == 60
+        assert args.query_timeout == 120
+        assert args.server_bin == "/path/to/server"
+        assert args.chars_per_token == 3.5
 
     def test_missing_required_arg(self):
         with pytest.raises(SystemExit):
             niah.parse_args([])
-
-
-# ===================================================================
-# run_config (integration-ish, fully mocked)
-# ===================================================================
-
-
-class TestRunConfig:
-    """Tests for run_config() with fully mocked server + queries."""
-
-    def _make_chat_response(self, content: str):
-        body = json.dumps({
-            "choices": [{"message": {"content": content}}]
-        }).encode()
-        resp = MagicMock()
-        resp.read.return_value = body
-        resp.__enter__ = MagicMock(return_value=resp)
-        resp.__exit__ = MagicMock(return_value=False)
-        return resp
-
-    def _make_health_response(self):
-        body = json.dumps({"status": "ok"}).encode()
-        resp = MagicMock()
-        resp.read.return_value = body
-        resp.__enter__ = MagicMock(return_value=resp)
-        resp.__exit__ = MagicMock(return_value=False)
-        return resp
-
-    @patch("time.sleep")
-    @patch("urllib.request.urlopen")
-    @patch("subprocess.Popen")
-    def test_run_config_single_needle_hit(self, mock_popen, mock_urlopen, mock_sleep):
-        """Full run_config with 1 needle that matches."""
-        proc = MagicMock()
-        proc.poll.return_value = None
-        mock_popen.return_value = proc
-
-        # We need to know what code seed=42 generates for Paris
-        rng = random.Random(42)
-        expected_code = rng.randint(100000, 999999)
-
-        # First call is health check, subsequent are query calls
-        mock_urlopen.side_effect = [
-            self._make_health_response(),
-            self._make_chat_response(str(expected_code)),
-        ]
-
-        with tempfile.TemporaryDirectory() as td:
-            server_bin = Path(td) / "build" / "bin" / "llama-server"
-            server_bin.parent.mkdir(parents=True)
-            server_bin.touch()
-
-            result = niah.run_config(
-                Path(td), Path("/fake/model.gguf"), "q8_0", 4096, 1, 8090
-            )
-            assert result.accuracy == "1/1"
-            assert result.accuracy_pct == 100.0
-
-    @patch("time.sleep")
-    @patch("urllib.request.urlopen")
-    @patch("subprocess.Popen")
-    def test_run_config_needle_miss(self, mock_popen, mock_urlopen, mock_sleep):
-        """Full run_config with 1 needle that doesn't match."""
-        proc = MagicMock()
-        proc.poll.return_value = None
-        mock_popen.return_value = proc
-
-        mock_urlopen.side_effect = [
-            self._make_health_response(),
-            self._make_chat_response("I have no idea"),
-        ]
-
-        with tempfile.TemporaryDirectory() as td:
-            server_bin = Path(td) / "build" / "bin" / "llama-server"
-            server_bin.parent.mkdir(parents=True)
-            server_bin.touch()
-
-            result = niah.run_config(
-                Path(td), Path("/fake/model.gguf"), "q8_0", 4096, 1, 8090
-            )
-            assert result.accuracy == "0/1"
-            assert result.accuracy_pct == 0.0
-
-    @patch("time.sleep")
-    @patch("urllib.request.urlopen")
-    @patch("subprocess.Popen")
-    def test_run_config_stops_server_on_error(self, mock_popen, mock_urlopen, mock_sleep):
-        """Server should be stopped even if query raises."""
-        proc = MagicMock()
-        proc.poll.return_value = None
-        mock_popen.return_value = proc
-
-        mock_urlopen.side_effect = [
-            self._make_health_response(),
-            urllib.error.URLError("timeout"),
-            urllib.error.URLError("timeout"),
-            urllib.error.URLError("timeout"),
-        ]
-
-        with tempfile.TemporaryDirectory() as td:
-            server_bin = Path(td) / "build" / "bin" / "llama-server"
-            server_bin.parent.mkdir(parents=True)
-            server_bin.touch()
-
-            with pytest.raises(RuntimeError):
-                niah.run_config(
-                    Path(td), Path("/fake/model.gguf"), "q8_0", 4096, 1, 8090
-                )
-
-        # Server should have been stopped in the finally block
-        proc.terminate.assert_called()
-
-
-# ===================================================================
-# run_all (integration, fully mocked)
-# ===================================================================
-
-
-class TestRunAll:
-    """Tests for run_all() with fully mocked internals."""
-
-    @patch.object(niah, "run_config")
-    @patch.object(niah, "_find_free_port", return_value=8090)
-    def test_run_all_iterates_configs(self, mock_port, mock_run_config):
-        """run_all should call run_config for each (depth, needle, cache) combo."""
-        mock_run_config.return_value = niah.ConfigResult(
-            depth=4096, needle_count=1, cache_type="q8_0",
-            trials=[niah.TrialResult("Paris", 123456, "123456", True)],
-        )
-
-        with tempfile.TemporaryDirectory() as td:
-            llama_dir = Path(td)
-            model_path = llama_dir / "model.gguf"
-            model_path.touch()
-            server_bin = llama_dir / "build" / "bin" / "llama-server"
-            server_bin.parent.mkdir(parents=True)
-            server_bin.touch()
-
-            args = niah.parse_args([
-                str(llama_dir), str(model_path),
-                "--depths", "4096",
-                "--needles", "1",
-                "--cache-types", "q8_0",
-            ])
-            results = niah.run_all(args)
-            assert len(results) == 1
-            mock_run_config.assert_called_once()
-
-    @patch.object(niah, "run_config")
-    @patch.object(niah, "_find_free_port", return_value=8090)
-    def test_run_all_handles_config_error(self, mock_port, mock_run_config):
-        """Errors in run_config should be caught and recorded as failed."""
-        mock_run_config.side_effect = RuntimeError("server exploded")
-
-        with tempfile.TemporaryDirectory() as td:
-            llama_dir = Path(td)
-            model_path = llama_dir / "model.gguf"
-            model_path.touch()
-            server_bin = llama_dir / "build" / "bin" / "llama-server"
-            server_bin.parent.mkdir(parents=True)
-            server_bin.touch()
-
-            args = niah.parse_args([
-                str(llama_dir), str(model_path),
-                "--depths", "4096",
-                "--needles", "1",
-                "--cache-types", "q8_0",
-            ])
-            results = niah.run_all(args)
-            assert len(results) == 1
-            assert results[0].trials == []
-            assert results[0].accuracy_pct == 0.0
-
-    def test_run_all_missing_llama_dir(self):
-        """Should sys.exit if llama dir doesn't exist."""
-        args = niah.parse_args(["/nonexistent/llama", "/nonexistent/model.gguf"])
-        with pytest.raises(SystemExit):
-            niah.run_all(args)
-
-    @patch.object(niah, "run_config")
-    @patch.object(niah, "_find_free_port", return_value=8090)
-    def test_run_all_multiple_configs(self, mock_port, mock_run_config):
-        """Should produce N results for N config combos."""
-        mock_run_config.return_value = niah.ConfigResult(
-            depth=4096, needle_count=1, cache_type="q8_0",
-            trials=[niah.TrialResult("Paris", 123456, "123456", True)],
-        )
-
-        with tempfile.TemporaryDirectory() as td:
-            llama_dir = Path(td)
-            model_path = llama_dir / "model.gguf"
-            model_path.touch()
-            server_bin = llama_dir / "build" / "bin" / "llama-server"
-            server_bin.parent.mkdir(parents=True)
-            server_bin.touch()
-
-            args = niah.parse_args([
-                str(llama_dir), str(model_path),
-                "--depths", "4096,8192",
-                "--needles", "1,5",
-                "--cache-types", "q8_0,turbo3",
-            ])
-            results = niah.run_all(args)
-            # 2 depths * 2 needle_counts * 2 cache_types = 8
-            assert len(results) == 8
 
 
 # ===================================================================
@@ -872,38 +966,93 @@ class TestMain:
     """Tests for main()."""
 
     @patch.object(niah, "save_results", return_value=(Path("/fake/results.json"), Path("/fake/results.md")))
-    @patch.object(niah, "build_table", return_value="| table |")
-    @patch.object(niah, "run_all")
-    def test_main_happy_path(self, mock_run_all, mock_build_table, mock_save):
-        """main() should parse args, run all, build table, save results."""
-        mock_run_all.return_value = [
-            niah.ConfigResult(depth=4096, needle_count=1, cache_type="q8_0",
-                              trials=[niah.TrialResult("Paris", 123456, "123456", True)])
-        ]
-        # Should not raise
-        niah.main(["/fake/llama", "/fake/model.gguf", "--depths", "4096", "--needles", "1"])
-        mock_run_all.assert_called_once()
-        mock_build_table.assert_called_once()
-        mock_save.assert_called_once()
+    @patch.object(niah, "build_output", return_value="output text")
+    @patch.object(niah, "run_single_mode", return_value=[])
+    def test_main_single_mode(self, mock_run, mock_output, mock_save):
+        with tempfile.TemporaryDirectory() as td:
+            llama_dir = Path(td)
+            model_path = llama_dir / "model.gguf"
+            model_path.touch()
+            server_bin = llama_dir / "build" / "bin" / "llama-server"
+            server_bin.parent.mkdir(parents=True)
+            server_bin.touch()
+
+            niah.main([str(llama_dir), str(model_path), "--mode", "single"])
+            mock_run.assert_called_once()
 
     @patch.object(niah, "save_results", return_value=(Path("/fake/results.json"), Path("/fake/results.md")))
-    @patch.object(niah, "build_table", return_value="| table |")
-    @patch.object(niah, "run_all", return_value=[])
-    def test_main_custom_output_dir(self, mock_run_all, mock_build_table, mock_save):
-        """main() should respect --output-dir."""
-        niah.main(["/fake/llama", "/fake/model.gguf", "--output-dir", "/tmp/custom_out"])
-        # Verify save_results was called with the custom output dir
-        call_args = mock_save.call_args
-        assert str(call_args[0][2]) == "/tmp/custom_out"
+    @patch.object(niah, "build_output", return_value="output text")
+    @patch.object(niah, "run_multi_key_mode", return_value=[])
+    def test_main_multi_key_mode(self, mock_run, mock_output, mock_save):
+        with tempfile.TemporaryDirectory() as td:
+            llama_dir = Path(td)
+            model_path = llama_dir / "model.gguf"
+            model_path.touch()
+            server_bin = llama_dir / "build" / "bin" / "llama-server"
+            server_bin.parent.mkdir(parents=True)
+            server_bin.touch()
+
+            niah.main([str(llama_dir), str(model_path), "--mode", "multi-key"])
+            mock_run.assert_called_once()
 
     @patch.object(niah, "save_results", return_value=(Path("/fake/results.json"), Path("/fake/results.md")))
-    @patch.object(niah, "build_table", return_value="| table |")
-    @patch.object(niah, "run_all", return_value=[])
-    def test_main_default_output_dir(self, mock_run_all, mock_build_table, mock_save):
-        """main() with no --output-dir should default to 'niah_results'."""
-        niah.main(["/fake/llama", "/fake/model.gguf"])
-        call_args = mock_save.call_args
-        assert str(call_args[0][2]) == "niah_results"
+    @patch.object(niah, "build_output", return_value="output text")
+    @patch.object(niah, "run_multi_value_mode", return_value=[])
+    def test_main_multi_value_mode(self, mock_run, mock_output, mock_save):
+        with tempfile.TemporaryDirectory() as td:
+            llama_dir = Path(td)
+            model_path = llama_dir / "model.gguf"
+            model_path.touch()
+            server_bin = llama_dir / "build" / "bin" / "llama-server"
+            server_bin.parent.mkdir(parents=True)
+            server_bin.touch()
+
+            niah.main([str(llama_dir), str(model_path), "--mode", "multi-value"])
+            mock_run.assert_called_once()
+
+    def test_main_missing_model_path(self):
+        """Should sys.exit if model_path not provided."""
+        with tempfile.TemporaryDirectory() as td:
+            llama_dir = Path(td)
+            server_bin = llama_dir / "build" / "bin" / "llama-server"
+            server_bin.parent.mkdir(parents=True)
+            server_bin.touch()
+
+            with pytest.raises(SystemExit):
+                niah.main([str(llama_dir)])
+
+    @patch.object(niah, "save_results", return_value=(Path("/fake/results.json"), Path("/fake/results.md")))
+    @patch.object(niah, "build_output", return_value="output text")
+    @patch.object(niah, "run_single_mode", return_value=[])
+    def test_main_default_output_dir(self, mock_run, mock_output, mock_save):
+        with tempfile.TemporaryDirectory() as td:
+            llama_dir = Path(td)
+            model_path = llama_dir / "model.gguf"
+            model_path.touch()
+            server_bin = llama_dir / "build" / "bin" / "llama-server"
+            server_bin.parent.mkdir(parents=True)
+            server_bin.touch()
+
+            niah.main([str(llama_dir), str(model_path)])
+            call_args = mock_save.call_args
+            # output_dir is the 4th positional arg
+            assert str(call_args[0][3]) == "niah_results"
+
+    @patch.object(niah, "save_results", return_value=(Path("/fake/results.json"), Path("/fake/results.md")))
+    @patch.object(niah, "build_output", return_value="output text")
+    @patch.object(niah, "run_single_mode", return_value=[])
+    def test_main_custom_output_dir(self, mock_run, mock_output, mock_save):
+        with tempfile.TemporaryDirectory() as td:
+            llama_dir = Path(td)
+            model_path = llama_dir / "model.gguf"
+            model_path.touch()
+            server_bin = llama_dir / "build" / "bin" / "llama-server"
+            server_bin.parent.mkdir(parents=True)
+            server_bin.touch()
+
+            niah.main([str(llama_dir), str(model_path), "--output-dir", "/tmp/custom_out"])
+            call_args = mock_save.call_args
+            assert str(call_args[0][3]) == "/tmp/custom_out"
 
 
 # ===================================================================
@@ -926,7 +1075,6 @@ class TestStartServerVerbose:
     @patch("urllib.request.urlopen")
     @patch("subprocess.Popen")
     def test_verbose_prints_cmd(self, mock_popen, mock_urlopen, mock_sleep, capsys):
-        """Verbose mode should print the server command."""
         proc = MagicMock()
         proc.poll.return_value = None
         mock_popen.return_value = proc
@@ -946,7 +1094,6 @@ class TestStartServerVerbose:
     @patch("urllib.request.urlopen")
     @patch("subprocess.Popen")
     def test_verbose_passes_stdout_stderr(self, mock_popen, mock_urlopen, mock_sleep):
-        """Verbose mode should pass stdout/stderr=None (not DEVNULL)."""
         proc = MagicMock()
         proc.poll.return_value = None
         mock_popen.return_value = proc
@@ -963,99 +1110,27 @@ class TestStartServerVerbose:
         assert call_kwargs["stdout"] is None
         assert call_kwargs["stderr"] is None
 
-    def _make_health_response(self):
-        body = json.dumps({"status": "ok"}).encode()
-        resp = MagicMock()
-        resp.read.return_value = body
-        resp.__enter__ = MagicMock(return_value=resp)
-        resp.__exit__ = MagicMock(return_value=False)
-        return resp
-
 
 # ===================================================================
-# run_config verbose mode
+# No /Users/tom/ in output
 # ===================================================================
 
 
-class TestRunConfigVerbose:
-    """Test verbose output in run_config()."""
+class TestNoHomeDir:
+    """Ensure no hardcoded /Users/tom/ paths leak into test output."""
 
-    def _make_health_response(self):
-        body = json.dumps({"status": "ok"}).encode()
-        resp = MagicMock()
-        resp.read.return_value = body
-        resp.__enter__ = MagicMock(return_value=resp)
-        resp.__exit__ = MagicMock(return_value=False)
-        return resp
-
-    def _make_chat_response(self, content: str):
-        body = json.dumps({
-            "choices": [{"message": {"content": content}}]
-        }).encode()
-        resp = MagicMock()
-        resp.read.return_value = body
-        resp.__enter__ = MagicMock(return_value=resp)
-        resp.__exit__ = MagicMock(return_value=False)
-        return resp
-
-    @patch("time.sleep")
-    @patch("urllib.request.urlopen")
-    @patch("subprocess.Popen")
-    def test_verbose_prints_haystack_info(self, mock_popen, mock_urlopen, mock_sleep, capsys):
-        """Verbose run_config should print haystack length and needle positions."""
-        proc = MagicMock()
-        proc.poll.return_value = None
-        mock_popen.return_value = proc
-
+    def test_filler_no_home_dir(self):
         rng = random.Random(42)
-        expected_code = rng.randint(100000, 999999)
+        paragraphs = niah._build_filler(4000, rng)
+        for p in paragraphs:
+            assert "/Users/tom/" not in p
 
-        mock_urlopen.side_effect = [
-            self._make_health_response(),
-            self._make_chat_response(str(expected_code)),
-        ]
+    def test_needle_sentence_no_home_dir(self):
+        n = niah.Needle(key="The special magic number is", value="1234567", depth_pct=0.5)
+        assert "/Users/tom/" not in n.sentence
 
-        with tempfile.TemporaryDirectory() as td:
-            server_bin = Path(td) / "build" / "bin" / "llama-server"
-            server_bin.parent.mkdir(parents=True)
-            server_bin.touch()
-
-            niah.run_config(
-                Path(td), Path("/fake/model.gguf"), "q8_0", 4096, 1, 8090, verbose=True
-            )
-
-        captured = capsys.readouterr()
-        assert "Haystack length" in captured.out
-        assert "Needle:" in captured.out
-
-
-# ===================================================================
-# run_all missing model file
-# ===================================================================
-
-
-class TestRunAllEdgeCases:
-    """Additional edge cases for run_all()."""
-
-    def test_run_all_missing_model_file(self):
-        """Should sys.exit if model file doesn't exist."""
-        with tempfile.TemporaryDirectory() as td:
-            llama_dir = Path(td)
-            server_bin = llama_dir / "build" / "bin" / "llama-server"
-            server_bin.parent.mkdir(parents=True)
-            server_bin.touch()
-
-            args = niah.parse_args([str(llama_dir), "/nonexistent/model.gguf"])
-            with pytest.raises(SystemExit):
-                niah.run_all(args)
-
-    def test_run_all_missing_server_binary(self):
-        """Should sys.exit if llama-server binary doesn't exist."""
-        with tempfile.TemporaryDirectory() as td:
-            llama_dir = Path(td)
-            model_path = llama_dir / "model.gguf"
-            model_path.touch()
-
-            args = niah.parse_args([str(llama_dir), str(model_path)])
-            with pytest.raises(SystemExit):
-                niah.run_all(args)
+    def test_heatmap_no_home_dir(self):
+        r = niah.ConfigResult(mode="single", context_length=4096, cache_type="q8_0", needle_depth_pct=0.5)
+        r.trials = [niah.TrialResult(expected="1234567", response="1234567", found=True)]
+        table = niah._build_heatmap_table([r], "q8_0", "test-model")
+        assert "/Users/tom/" not in table

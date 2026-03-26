@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
-"""TurboQuant Needle-In-A-Haystack (NIAH) Test.
+"""TurboQuant Needle-In-A-Haystack (NIAH) Benchmark v2
 
-Measures retrieval accuracy across cache types, context depths, and needle counts.
-Spins up llama-server for each configuration, inserts unique "needle" facts into
-filler text, then queries each needle and scores exact-match retrieval.
+Industry-standard NIAH test following Kamradt (2023) and NVIDIA RULER (2024)
+methodology for evaluating KV cache compression quality.
+
+Methodology:
+  - Kamradt: github.com/gkamradt/LLMTest_NeedleInAHaystack
+  - RULER: github.com/NVIDIA/RULER (COLM 2024, arXiv:2404.06654)
+  - OpenCompass NeedleBench: opencompass.readthedocs.io
+
+Modes:
+  single     Kamradt single-needle: sweep depth (0-100%) x context length
+  multi-key  RULER MK-NIAH: real needle + distractors, sweep context length
+  multi-value RULER MV-NIAH: multiple same-key needles, sweep length x count
 
 Usage:
     python3 scripts/niah_test.py /path/to/llama.cpp /path/to/model.gguf
+    python3 scripts/niah_test.py /path/to/llama.cpp /path/to/model.gguf --mode single
+    python3 scripts/niah_test.py /path/to/llama.cpp /path/to/model.gguf --mode multi-key
+    python3 scripts/niah_test.py /path/to/llama.cpp /path/to/model.gguf --mode multi-value
     python3 scripts/niah_test.py --help
 
 Requirements: Python 3.10+ stdlib only (no pip deps).
@@ -40,121 +52,417 @@ from typing import Optional
 
 SEED = 42
 
-CITIES = [
-    "Paris", "Tokyo", "Mumbai", "Cairo", "Lima",
-    "Oslo", "Seoul", "Rome", "Dublin", "Nairobi",
-    "Berlin", "Sydney", "Toronto", "Bangkok", "Lisbon",
-    "Stockholm", "Athens", "Jakarta", "Santiago", "Helsinki",
+# 24 diverse filler paragraphs (~150-200 words each) covering different topics.
+# These simulate real essay text a la Paul Graham essays (the de facto NIAH
+# standard), but are original to avoid copyright issues.  Each paragraph is on
+# a distinct topic so the haystack never feels repetitive within a single test.
+FILLER_PARAGRAPHS = [
+    # 1 — Astronomy
+    (
+        "The observable universe spans roughly 93 billion light-years in diameter, "
+        "a figure that continues to grow as space itself expands. Within this volume "
+        "lie an estimated two trillion galaxies, each hosting hundreds of billions of "
+        "stars. Our own Milky Way is a barred spiral galaxy approximately 100,000 "
+        "light-years across, containing between 100 and 400 billion stars. The Sun, "
+        "an unremarkable yellow dwarf, orbits the galactic center at about 230 "
+        "kilometers per second, completing one full revolution every 225 to 250 "
+        "million years. Despite the staggering numbers, the universe is overwhelmingly "
+        "empty: if you shrank the Sun to the size of a grain of sand, the nearest "
+        "star would be roughly four miles away. This vast emptiness is punctuated "
+        "by gravitational wells that shape the large-scale structure of the cosmos "
+        "into filaments, walls, and voids that stretch across hundreds of millions "
+        "of light-years."
+    ),
+    # 2 — Roman engineering
+    (
+        "Roman engineers perfected the art of concrete construction over two thousand "
+        "years ago, and many of their structures still stand today. The Pantheon in "
+        "Rome, completed around 125 AD, features an unreinforced concrete dome that "
+        "remains the world's largest of its kind, spanning 43.3 meters. The secret "
+        "lay in their mixture: volcanic ash from Pozzuoli combined with lime and "
+        "seawater created a remarkably durable material now called pozzolanic "
+        "concrete. Modern researchers have discovered that seawater actually "
+        "strengthened the material over time by promoting the growth of interlocking "
+        "mineral crystals within the matrix. Roman aqueducts, another engineering "
+        "marvel, carried water across vast distances using gravity alone, maintaining "
+        "a gentle downward slope of roughly one meter per kilometer. The Pont du "
+        "Gard in southern France stands 49 meters high and carried water 50 "
+        "kilometers from its source to the city of Nimes."
+    ),
+    # 3 — Deep-sea biology
+    (
+        "The hadal zone, comprising ocean trenches deeper than 6,000 meters, "
+        "represents one of the least explored environments on Earth. Despite "
+        "crushing pressures exceeding 1,000 atmospheres, thriving ecosystems exist "
+        "in these depths. Snailfish have been observed at nearly 8,200 meters in "
+        "the Mariana Trench, making them the deepest-living fish known to science. "
+        "Amphipods, small crustaceans related to shrimp, have been collected from "
+        "the very bottom of the Challenger Deep at 10,994 meters. These organisms "
+        "have evolved specialized proteins and cell membranes that remain functional "
+        "under extreme pressure. Hydrothermal vents, first discovered in 1977 near "
+        "the Galapagos Rift, support dense communities of tube worms, clams, and "
+        "shrimp that derive energy from chemosynthesis rather than photosynthesis. "
+        "The discovery fundamentally changed our understanding of where life can "
+        "exist and fueled speculation about life on ocean worlds like Europa."
+    ),
+    # 4 — Printing and literacy
+    (
+        "The invention of movable type by Johannes Gutenberg around 1440 triggered "
+        "a revolution in the dissemination of knowledge across Europe. Before the "
+        "printing press, a single book could take months to copy by hand, and "
+        "libraries of a few hundred volumes were considered extraordinary. Within "
+        "fifty years of Gutenberg's innovation, an estimated twenty million volumes "
+        "had been printed, covering subjects from theology and law to astronomy and "
+        "medicine. Literacy rates climbed steadily as printed material became "
+        "affordable for the emerging middle class. Martin Luther's Ninety-Five "
+        "Theses, posted in 1517, spread across Germany in weeks thanks to the press, "
+        "accelerating the Protestant Reformation. By the seventeenth century, "
+        "newspapers and periodicals had appeared in major European cities, creating "
+        "a public sphere of discourse that scholars consider a precondition for "
+        "modern democracy. The parallels with today's digital information revolution "
+        "are striking, if imperfect."
+    ),
+    # 5 — Plate tectonics
+    (
+        "The theory of plate tectonics, formalized in the 1960s, explains the "
+        "large-scale motions of Earth's lithosphere. The outer shell of the planet "
+        "is divided into roughly fifteen major plates that float on the semi-fluid "
+        "asthenosphere below. These plates move at rates comparable to the growth "
+        "of a human fingernail, typically two to ten centimeters per year. Where "
+        "plates diverge, magma wells up to create new ocean floor, as seen along "
+        "the Mid-Atlantic Ridge. Where they converge, one plate may subduct beneath "
+        "another, generating deep ocean trenches and volcanic arcs like the Andes. "
+        "Transform boundaries, where plates slide past each other horizontally, "
+        "produce devastating earthquakes; the San Andreas Fault in California is "
+        "the most famous example. Plate tectonics also drives the supercontinent "
+        "cycle: roughly every 400 to 600 million years, the continents merge into "
+        "a single landmass before breaking apart again."
+    ),
+    # 6 — Coffee cultivation
+    (
+        "Coffee cultivation began in the highlands of Ethiopia, where the Coffea "
+        "arabica plant still grows wild in montane forests. According to legend, "
+        "a goat herder named Kaldi noticed his animals became unusually energetic "
+        "after eating red berries from a certain shrub. By the fifteenth century, "
+        "coffee was being roasted and brewed in Yemen, and coffeehouses had become "
+        "centers of intellectual exchange across the Ottoman Empire. The Dutch "
+        "smuggled coffee plants to Java in the late 1600s, breaking the Arab "
+        "monopoly and establishing plantations across Southeast Asia. Today, "
+        "Brazil produces roughly a third of the world's coffee, followed by Vietnam, "
+        "Colombia, and Indonesia. A single coffee tree yields about two thousand "
+        "cherries per year, producing roughly one pound of roasted beans. Climate "
+        "change threatens arabica production, as the plant requires specific "
+        "temperature and rainfall conditions found in a narrow tropical band."
+    ),
+    # 7 — Music theory
+    (
+        "Western music theory traces its roots to Pythagoras, who discovered that "
+        "harmonious intervals correspond to simple numerical ratios of string "
+        "lengths. An octave is a 2:1 ratio, a perfect fifth 3:2, and a perfect "
+        "fourth 4:3. This insight laid the groundwork for the mathematical study "
+        "of harmony that persists to this day. The twelve-tone equal temperament "
+        "system, adopted widely in the eighteenth century, divides the octave into "
+        "twelve equal semitones, each separated by a frequency ratio of the twelfth "
+        "root of two. This compromise sacrifices the purity of Pythagorean intervals "
+        "but allows instruments to play in any key without retuning. Johann "
+        "Sebastian Bach's Well-Tempered Clavier, composed in 1722, demonstrated the "
+        "versatility of this system with preludes and fugues in all twenty-four "
+        "major and minor keys. Modern electronic music has pushed beyond these "
+        "boundaries, exploring microtonal scales and algorithmic composition."
+    ),
+    # 8 — Glacier dynamics
+    (
+        "Glaciers cover approximately ten percent of Earth's land surface and hold "
+        "about 69 percent of the world's fresh water. The Antarctic Ice Sheet alone "
+        "contains enough ice to raise global sea levels by roughly 58 meters if it "
+        "were to melt entirely. Glaciers move under their own weight through a "
+        "combination of internal deformation and basal sliding, the latter occurring "
+        "when meltwater lubricates the interface between ice and bedrock. Some outlet "
+        "glaciers in Greenland flow at speeds exceeding ten kilometers per year, "
+        "calving massive icebergs into the North Atlantic. Glacial retreat has "
+        "accelerated dramatically since the 1990s; between 2000 and 2019, the "
+        "world's glaciers lost an average of 267 billion tonnes of ice annually. "
+        "This meltwater contributes to sea-level rise, alters ocean salinity and "
+        "circulation patterns, and threatens freshwater supplies for hundreds of "
+        "millions of people who depend on glacial runoff."
+    ),
+    # 9 — Silk Road trade
+    (
+        "The Silk Road was a network of trade routes connecting East Asia to the "
+        "Mediterranean, active from roughly the second century BC to the fifteenth "
+        "century AD. Contrary to popular imagination, no single merchant traveled "
+        "the entire route; instead, goods passed through a series of intermediaries "
+        "across Central Asian oases. Silk, porcelain, and spices moved westward, "
+        "while glassware, wool, and precious metals flowed east. Beyond material "
+        "goods, the Silk Road transmitted religions, languages, technologies, and "
+        "diseases. Buddhism spread from India to China along these routes, while "
+        "papermaking and gunpowder eventually reached Europe. The Black Death of "
+        "the fourteenth century also traveled the Silk Road, carried by fleas on "
+        "marmots and rats. At its peak, the network spanned over 6,400 kilometers "
+        "from Chang'an in China to Constantinople, passing through deserts, mountain "
+        "ranges, and steppes."
+    ),
+    # 10 — Semiconductor fabrication
+    (
+        "Modern semiconductor fabrication is among the most complex manufacturing "
+        "processes ever devised. A single microprocessor contains billions of "
+        "transistors, each smaller than a virus, etched into silicon wafers using "
+        "extreme ultraviolet lithography. The light source for EUV lithography "
+        "operates at a wavelength of 13.5 nanometers, produced by blasting tiny "
+        "droplets of molten tin with a powerful laser fifty thousand times per "
+        "second. Each wafer undergoes hundreds of processing steps over several "
+        "weeks, including deposition, etching, ion implantation, and chemical "
+        "mechanical polishing. The cleanrooms where fabrication occurs are ten "
+        "thousand times cleaner than a hospital operating theater, with fewer than "
+        "ten particles larger than 0.1 micrometers per cubic meter of air. A "
+        "single leading-edge fab costs upward of twenty billion dollars to build "
+        "and equip, making semiconductor manufacturing one of the most capital- "
+        "intensive industries on the planet."
+    ),
+    # 11 — Pollination biology
+    (
+        "Pollination is essential for the reproduction of roughly 87 percent of "
+        "flowering plant species and underpins an estimated 35 percent of global "
+        "food production. Bees are the most important pollinators, but butterflies, "
+        "moths, flies, beetles, birds, and even bats also play significant roles. "
+        "A single honeybee colony can visit millions of flowers per day, and the "
+        "economic value of pollination services has been estimated at hundreds of "
+        "billions of dollars annually. Some plants have evolved extraordinarily "
+        "specific relationships with their pollinators: the fig wasp, for instance, "
+        "can only reproduce inside fig fruit, while the fig depends entirely on the "
+        "wasp for pollination. Colony collapse disorder, first reported in 2006, "
+        "drew global attention to the decline of managed honeybee populations. "
+        "Causes remain debated but likely include a combination of pesticide "
+        "exposure, parasites such as Varroa destructor, habitat loss, and disease."
+    ),
+    # 12 — Architecture of Gothic cathedrals
+    (
+        "Gothic cathedrals represent one of the most ambitious building programs in "
+        "European history, spanning from the twelfth to the sixteenth century. The "
+        "key structural innovation was the pointed arch, which distributes weight "
+        "more efficiently than the rounded Romanesque arch and allows for taller, "
+        "thinner walls. Flying buttresses transferred the lateral thrust of the "
+        "vaulted ceiling to external supports, freeing the walls for enormous "
+        "stained-glass windows that flooded interiors with colored light. Chartres "
+        "Cathedral, completed around 1220, contains over 150 windows with more than "
+        "four thousand individual figures. Notre-Dame de Paris took nearly two "
+        "centuries to complete and survived eight hundred years before a devastating "
+        "fire in 2019. The masons who built these structures worked without modern "
+        "engineering tools, relying on geometric rules of thumb passed down through "
+        "guild traditions."
+    ),
+    # 13 — Neuroscience of memory
+    (
+        "Human memory is not a single system but a collection of interrelated "
+        "processes distributed across multiple brain regions. Short-term memory, "
+        "which holds information for seconds to minutes, relies heavily on the "
+        "prefrontal cortex. Long-term memory consolidation involves the hippocampus, "
+        "a seahorse-shaped structure deep in the temporal lobe. During sleep, "
+        "especially during slow-wave stages, the hippocampus replays the day's "
+        "experiences and gradually transfers them to the neocortex for permanent "
+        "storage. This process can take weeks or even years. Emotional memories "
+        "are processed in part by the amygdala, which explains why traumatic events "
+        "are often remembered with unusual vividness. The discovery of long-term "
+        "potentiation in 1973 provided a cellular mechanism for learning: repeated "
+        "stimulation of a synapse strengthens the connection between neurons, "
+        "effectively encoding information in the structure of the brain itself."
+    ),
+    # 14 — Fermentation and food science
+    (
+        "Fermentation is one of the oldest food-preservation techniques known to "
+        "humanity, predating written history by thousands of years. The process "
+        "relies on microorganisms, primarily yeasts and lactic acid bacteria, that "
+        "convert sugars into alcohol, acids, or gases under anaerobic conditions. "
+        "Bread, beer, wine, yogurt, cheese, kimchi, sauerkraut, and miso all owe "
+        "their existence to fermentation. Louis Pasteur established in the 1850s "
+        "that fermentation is a biological process driven by living organisms, "
+        "overturning the prevailing chemical theory. In winemaking, Saccharomyces "
+        "cerevisiae converts grape sugars into ethanol and carbon dioxide; the "
+        "specific strain and conditions determine the wine's character. Modern "
+        "fermentation science has expanded far beyond food, enabling the production "
+        "of antibiotics, biofuels, and recombinant proteins. Industrial bioreactors "
+        "can now culture microorganisms at scales of hundreds of thousands of liters."
+    ),
+    # 15 — Cartography
+    (
+        "The history of cartography reflects humanity's evolving understanding of "
+        "the world. The oldest known maps, etched on clay tablets in Mesopotamia "
+        "around 2300 BC, depicted local land features and irrigation canals. "
+        "Ptolemy's Geography, written in the second century AD, introduced a "
+        "coordinate system of latitude and longitude that remained influential for "
+        "over a thousand years. The Age of Exploration produced increasingly "
+        "accurate world maps, though distortion remained a fundamental challenge. "
+        "The Mercator projection, introduced in 1569, preserved straight-line "
+        "compass bearings for navigation but drastically exaggerated the size of "
+        "regions near the poles. Greenland, for instance, appears similar in size "
+        "to Africa on a Mercator map, despite being fourteen times smaller. Modern "
+        "geographic information systems combine satellite imagery, GPS data, and "
+        "computational geometry to produce maps of extraordinary precision, updated "
+        "in near real time."
+    ),
+    # 16 — Philosophy of language
+    (
+        "The philosophy of language examines the nature of meaning, reference, and "
+        "communication. Ludwig Wittgenstein's early work, the Tractatus Logico- "
+        "Philosophicus, proposed that language mirrors the logical structure of "
+        "reality, with each meaningful proposition corresponding to a possible state "
+        "of affairs. He later abandoned this picture theory in the Philosophical "
+        "Investigations, arguing instead that meaning arises from use within "
+        "language games embedded in forms of life. Ferdinand de Saussure, the "
+        "founder of structural linguistics, distinguished between langue, the "
+        "abstract system of a language, and parole, its concrete use in speech. "
+        "Noam Chomsky revolutionized the field in 1957 by proposing that humans "
+        "possess an innate universal grammar, a biological faculty that enables "
+        "language acquisition. The debate between nativist and empiricist accounts "
+        "of language learning continues to shape research in linguistics, cognitive "
+        "science, and artificial intelligence."
+    ),
+    # 17 — Volcanic activity
+    (
+        "Volcanic eruptions are among the most powerful natural phenomena on Earth, "
+        "capable of reshaping landscapes and altering global climate. The 1815 "
+        "eruption of Mount Tambora in Indonesia ejected an estimated 160 cubic "
+        "kilometers of material into the atmosphere, causing the Year Without a "
+        "Summer in 1816. Crops failed across Europe and North America, leading to "
+        "widespread famine and social unrest. Supervolcanoes, such as the caldera "
+        "beneath Yellowstone National Park, have the potential for eruptions "
+        "thousands of times larger than typical volcanic events. The last Yellowstone "
+        "supereruption occurred roughly 640,000 years ago and blanketed much of "
+        "North America in ash. Despite their destructive potential, volcanoes also "
+        "create fertile soils, geothermal energy sources, and new land. Iceland, "
+        "situated on the Mid-Atlantic Ridge, generates nearly all its electricity "
+        "from geothermal and hydroelectric power, both linked to volcanic geology."
+    ),
+    # 18 — Typography and design
+    (
+        "Typography, the art and technique of arranging type, influences how we "
+        "perceive and process written information. The earliest typefaces, designed "
+        "for Gutenberg's press, imitated the handwritten letterforms of medieval "
+        "scribes. In the eighteenth century, designers like John Baskerville and "
+        "Giambattista Bodoni introduced typefaces with higher contrast between thick "
+        "and thin strokes, reflecting Enlightenment ideals of clarity and reason. "
+        "The sans-serif typeface emerged in the nineteenth century and became "
+        "synonymous with modernism; Helvetica, designed in 1957 by Max Miedinger, "
+        "remains one of the most widely used typefaces in the world. Digital "
+        "typography introduced variable fonts, which encode an entire family of "
+        "weights and widths in a single file. Research consistently shows that "
+        "typography affects reading speed, comprehension, and emotional response, "
+        "making it a critical but often overlooked element of effective communication."
+    ),
+    # 19 — Cryptography
+    (
+        "Cryptography has evolved from simple substitution ciphers used by Julius "
+        "Caesar to the complex mathematical algorithms that secure modern digital "
+        "communication. The Caesar cipher, which shifts each letter by a fixed "
+        "number of positions, is trivially broken by frequency analysis. The Enigma "
+        "machine, used by Nazi Germany during World War II, employed a series of "
+        "rotating electromechanical rotors to produce polyalphabetic substitutions "
+        "that were considered unbreakable. Alan Turing and his colleagues at "
+        "Bletchley Park cracked Enigma using a combination of mathematical insight "
+        "and electromechanical computers called bombes. The invention of public-key "
+        "cryptography in the 1970s by Diffie, Hellman, and later Rivest, Shamir, "
+        "and Adleman transformed the field, enabling secure communication between "
+        "parties who have never met. Today, RSA and elliptic curve cryptography "
+        "protect trillions of dollars in daily financial transactions."
+    ),
+    # 20 — Soil science
+    (
+        "Soil is a complex living system composed of mineral particles, organic "
+        "matter, water, air, and a staggering diversity of organisms. A single "
+        "teaspoon of healthy topsoil can contain more microorganisms than there are "
+        "people on Earth. Soil formation is extraordinarily slow: it takes roughly "
+        "five hundred to a thousand years to produce one inch of topsoil through "
+        "the weathering of rock, accumulation of organic material, and biological "
+        "activity. The world's soils store more carbon than the atmosphere and all "
+        "living plants combined, making them a critical component of the global "
+        "carbon cycle. Agricultural practices such as deep plowing, monoculture, "
+        "and excessive fertilizer use can degrade soil structure and deplete "
+        "nutrients. Regenerative agriculture, which emphasizes cover cropping, "
+        "minimal tillage, and crop rotation, aims to restore soil health while "
+        "maintaining productivity. Healthy soils also improve water retention and "
+        "reduce the risk of flooding and erosion."
+    ),
+    # 21 — Antarctic exploration
+    (
+        "The race to the South Pole in the early twentieth century remains one of "
+        "the most dramatic episodes in the history of exploration. Roald Amundsen's "
+        "Norwegian team reached the pole on December 14, 1911, using dog sleds and "
+        "carefully pre-positioned supply depots. Robert Falcon Scott's British "
+        "expedition arrived 34 days later, only to find Amundsen's tent and flag "
+        "already in place. Scott and his four companions perished on the return "
+        "journey, trapped by a blizzard just 11 miles from a supply depot. Ernest "
+        "Shackleton's Endurance expedition of 1914 to 1917, though it never reached "
+        "the continent, became legendary for the crew's survival after their ship "
+        "was crushed by pack ice in the Weddell Sea. Today, Antarctica hosts over "
+        "seventy research stations operated by thirty countries, studying climate, "
+        "glaciology, astronomy, and biology in one of the most extreme environments "
+        "on the planet."
+    ),
+    # 22 — Probability theory
+    (
+        "Probability theory, the mathematical framework for reasoning about "
+        "uncertainty, traces its origins to a 1654 correspondence between Blaise "
+        "Pascal and Pierre de Fermat concerning the fair division of stakes in an "
+        "interrupted game of chance. Andrey Kolmogorov formalized the theory in "
+        "1933 with his axioms, establishing probability as a branch of measure "
+        "theory. The central limit theorem, one of the most important results in "
+        "statistics, states that the sum of a large number of independent random "
+        "variables tends toward a normal distribution regardless of the individual "
+        "distributions. Bayesian inference, named after Thomas Bayes, provides a "
+        "principled method for updating beliefs in light of new evidence. Monte "
+        "Carlo methods, developed during the Manhattan Project, use random sampling "
+        "to approximate solutions to deterministic problems that are analytically "
+        "intractable. These tools are now indispensable in fields ranging from "
+        "physics and finance to machine learning and drug discovery."
+    ),
+    # 23 — Ancient navigation
+    (
+        "Polynesian navigators crossed thousands of miles of open Pacific Ocean "
+        "using techniques developed over millennia without any written instruments. "
+        "They read the stars, tracking the rising and setting points of specific "
+        "constellations to maintain course through the night. During the day, they "
+        "observed the direction of ocean swells, the behavior of seabirds, and the "
+        "color and temperature of the water to detect the proximity of land. "
+        "Stick charts, constructed from palm ribs and cowrie shells, encoded "
+        "patterns of ocean currents and wave refraction around islands. These "
+        "methods enabled the settlement of Hawaii, New Zealand, and Easter Island, "
+        "some of the most remote inhabited places on Earth. The voyaging canoe "
+        "Hokule'a, launched in 1975, demonstrated the viability of traditional "
+        "navigation by sailing from Hawaii to Tahiti without modern instruments, "
+        "sparking a cultural renaissance across the Pacific Islands."
+    ),
+    # 24 — Industrial Revolution
+    (
+        "The Industrial Revolution, beginning in Britain in the mid-eighteenth "
+        "century, fundamentally transformed the global economy and human society. "
+        "James Watt's improved steam engine, patented in 1769, provided a reliable "
+        "source of mechanical power that freed industry from dependence on water "
+        "mills and animal labor. Cotton textile production mechanized rapidly, with "
+        "spinning jennies, water frames, and power looms increasing output by orders "
+        "of magnitude. Urbanization accelerated as workers migrated from farms to "
+        "factory towns, creating unprecedented concentrations of population and "
+        "pollution. By 1850, Britain produced more than half the world's coal and "
+        "manufactured goods. The social consequences were profound: child labor, "
+        "dangerous working conditions, and vast wealth inequality fueled reform "
+        "movements and eventually reshaped labor laws, education, and public health "
+        "across the industrialized world."
+    ),
 ]
 
-# Filler paragraphs (~200 tokens / ~800 chars each). Repeating these fills
-# arbitrary context sizes without hardcoding 128 KB of text.
-FILLER_PARAGRAPHS = [
-    (
-        "The Amazon River, flowing through South America, is the largest river by "
-        "discharge volume of water in the world. It stretches approximately 6,400 "
-        "kilometers from the Andes Mountains in Peru to the Atlantic Ocean in Brazil. "
-        "The river basin covers about 7 million square kilometers and is home to the "
-        "Amazon Rainforest, which contains roughly 390 billion individual trees divided "
-        "into 16,000 species. The rainforest produces about 20 percent of the world's "
-        "oxygen and plays a crucial role in regulating the global climate. Scientists "
-        "have identified over 2,200 species of fish in the Amazon River system, making "
-        "it the most biodiverse river system on Earth."
-    ),
-    (
-        "The periodic table of elements organizes all known chemical elements by their "
-        "atomic number, electron configuration, and recurring chemical properties. "
-        "Dmitri Mendeleev published the first widely recognized periodic table in 1869, "
-        "predicting the existence and properties of elements not yet discovered. The "
-        "table currently contains 118 confirmed elements, with oganesson being the most "
-        "recently named. Elements are arranged in rows called periods and columns called "
-        "groups. Elements in the same group share similar chemical properties because "
-        "they have the same number of electrons in their outer shell. The lanthanides "
-        "and actinides are placed separately at the bottom of the table."
-    ),
-    (
-        "Mount Everest, located on the border between Nepal and Tibet, stands at 8,849 "
-        "meters above sea level, making it the tallest mountain on Earth. The first "
-        "confirmed ascent was made on May 29, 1953, by Sir Edmund Hillary and Tenzing "
-        "Norgay. The mountain was formed approximately 50 million years ago when the "
-        "Indian tectonic plate collided with the Eurasian plate. Climbers typically "
-        "attempt the summit during a narrow window in May when weather conditions are "
-        "most favorable. The mountain continues to grow at a rate of about 4 millimeters "
-        "per year due to ongoing geological forces."
-    ),
-    (
-        "The human brain contains approximately 86 billion neurons, each connected to "
-        "thousands of other neurons through synapses. The brain consumes about 20 "
-        "percent of the body's total energy despite accounting for only 2 percent of "
-        "body weight. Different regions of the brain are responsible for different "
-        "functions: the frontal lobe handles decision-making and planning, the temporal "
-        "lobe processes auditory information and memory, the parietal lobe integrates "
-        "sensory information, and the occipital lobe processes visual information. The "
-        "brain can process images in as little as 13 milliseconds and generates enough "
-        "electrical power to light a small bulb."
-    ),
-    (
-        "The Great Barrier Reef, located off the coast of Queensland, Australia, is the "
-        "world's largest coral reef system. It stretches over 2,300 kilometers and is "
-        "composed of over 2,900 individual reef systems and 900 islands. The reef is "
-        "home to 1,500 species of fish, 411 types of hard coral, and dozens of species "
-        "of sharks and rays. It can be seen from outer space and is the world's biggest "
-        "single structure made by living organisms. The reef has experienced significant "
-        "bleaching events due to rising ocean temperatures, with major events recorded "
-        "in 1998, 2002, 2016, 2017, 2020, and 2022."
-    ),
-    (
-        "The speed of light in a vacuum is exactly 299,792,458 meters per second, a "
-        "fundamental constant of nature denoted by the letter c. Albert Einstein's "
-        "special theory of relativity, published in 1905, established that nothing can "
-        "travel faster than light and that the speed of light is the same for all "
-        "observers regardless of their relative motion. Light from the Sun takes about "
-        "8 minutes and 20 seconds to reach Earth. The nearest star system, Alpha "
-        "Centauri, is approximately 4.37 light-years away. A light-year is the distance "
-        "light travels in one year, approximately 9.461 trillion kilometers."
-    ),
-    (
-        "The Sahara Desert in North Africa is the largest hot desert in the world, "
-        "covering approximately 9.2 million square kilometers. It spans 11 countries "
-        "including Algeria, Chad, Egypt, Libya, Mali, Mauritania, Morocco, Niger, "
-        "Sudan, Tunisia, and Western Sahara. Despite its reputation as an endless sea "
-        "of sand dunes, only about 25 percent of the Sahara is actually sandy. The "
-        "rest consists of rocky plateaus, gravel plains, dry valleys, and mountains. "
-        "The highest point in the Sahara is Emi Koussi, a shield volcano in Chad, "
-        "reaching 3,445 meters above sea level."
-    ),
-    (
-        "Jupiter is the largest planet in our solar system, with a mass more than twice "
-        "that of all other planets combined. Its Great Red Spot is a persistent "
-        "anticyclonic storm that has been observed since at least 1831 and is large "
-        "enough to contain two or three Earths. Jupiter has at least 95 known moons, "
-        "with the four largest known as the Galilean moons: Io, Europa, Ganymede, and "
-        "Callisto. Ganymede is the largest moon in the solar system, even bigger than "
-        "the planet Mercury. Jupiter's magnetic field is 14 times stronger than Earth's "
-        "and extends millions of kilometers into space."
-    ),
-    (
-        "The Pacific Ocean is the largest and deepest ocean on Earth, covering "
-        "approximately 165.25 million square kilometers. It contains the Mariana Trench, "
-        "the deepest point on Earth at approximately 10,994 meters below sea level. The "
-        "Pacific Ocean contains more than half of the free water on Earth and could fit "
-        "all the world's landmasses within its boundaries with room to spare. The Ring "
-        "of Fire, a horseshoe-shaped zone of intense seismic and volcanic activity, "
-        "encircles the Pacific and is home to about 75 percent of the world's active "
-        "volcanoes and 90 percent of the world's earthquakes."
-    ),
-    (
-        "The invention of the printing press by Johannes Gutenberg around 1440 is "
-        "considered one of the most important events in human history. Before the "
-        "printing press, books were copied by hand, a process that was slow, expensive, "
-        "and prone to errors. Gutenberg's movable type system allowed for the rapid "
-        "production of books and pamphlets, dramatically reducing their cost and "
-        "increasing literacy rates across Europe. The first major book printed using "
-        "this technology was the Gutenberg Bible, completed around 1455. Within 50 "
-        "years of Gutenberg's invention, an estimated 20 million volumes had been "
-        "printed across Europe."
-    ),
+# Distractor keys for multi-key mode (RULER MK-NIAH)
+DISTRACTOR_KEYS = [
+    "The secret password is",
+    "The hidden code is",
+    "The encrypted token is",
+    "The classified number is",
+    "The private identifier is",
+    "The concealed value is",
+    "The restricted sequence is",
+    "The confidential digit is",
+    "The protected cipher is",
+    "The obscured key is",
 ]
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -162,37 +470,35 @@ FILLER_PARAGRAPHS = [
 
 @dataclass
 class Needle:
-    """A single needle (fact) embedded in the haystack."""
-    city: str
-    code: int
-    position: float  # 0.0-1.0, where in the haystack it's inserted
-    sentence: str = ""
+    """A single needle embedded in the haystack."""
+    key: str          # e.g., "The special magic number is"
+    value: str        # e.g., "7281937"
+    depth_pct: float  # 0.0-1.0, where in the haystack it's inserted
 
-    def __post_init__(self) -> None:
-        self.sentence = f"The secret code for {self.city} is {self.code}."
+    @property
+    def sentence(self) -> str:
+        return f"{self.key}: {self.value}."
 
 
 @dataclass
 class TrialResult:
-    """Result of querying one needle."""
-    city: str
-    expected_code: int
+    """Result of one test query."""
+    expected: str
     response: str
     found: bool
+    needle_depth_pct: float = 0.0
+    context_length: int = 0
 
 
 @dataclass
 class ConfigResult:
-    """Result for one (depth, needle_count, cache_type) configuration."""
-    depth: int
-    needle_count: int
+    """Result for one test configuration."""
+    mode: str
+    context_length: int
     cache_type: str
+    needle_depth_pct: float = 0.5  # primary depth for single mode
+    needle_count: int = 1          # for multi-value mode
     trials: list[TrialResult] = field(default_factory=list)
-
-    @property
-    def accuracy(self) -> str:
-        hits = sum(1 for t in self.trials if t.found)
-        return f"{hits}/{len(self.trials)}"
 
     @property
     def accuracy_pct(self) -> float:
@@ -200,75 +506,97 @@ class ConfigResult:
             return 0.0
         return sum(1 for t in self.trials if t.found) / len(self.trials) * 100
 
+    @property
+    def passed(self) -> bool:
+        return all(t.found for t in self.trials)
+
 
 # ---------------------------------------------------------------------------
 # Haystack generation
 # ---------------------------------------------------------------------------
 
-def generate_needles(count: int, rng: random.Random) -> list[Needle]:
-    """Generate N needles with deterministic random codes."""
-    if count > len(CITIES):
-        raise ValueError(
-            f"--needles={count} exceeds available cities ({len(CITIES)}). "
-            f"Add more cities to CITIES list or reduce needle count."
-        )
-
-    cities = CITIES[:count]
-    if count == 1:
-        positions = [0.5]
-    else:
-        # Spread needles from 5% to 95% of the context to cover the FULL range
-        positions = [0.05 + (0.90 * i / (count - 1)) for i in range(count)]
-
-    needles = []
-    for city, pos in zip(cities, positions):
-        code = rng.randint(100000, 999999)
-        needles.append(Needle(city=city, code=code, position=pos))
-    return needles
+def _make_magic_number(rng: random.Random) -> str:
+    """Generate a 7-digit random number as a string."""
+    return str(rng.randint(1000000, 9999999))
 
 
-def generate_haystack(needles: list[Needle], target_chars: int) -> str:
-    """Build filler text with needles inserted at specified positions.
+def _build_filler(target_chars: int, rng: random.Random) -> list[str]:
+    """Build a list of filler paragraphs totaling approximately target_chars.
 
-    Args:
-        needles: List of Needle objects with position (0.0-1.0).
-        target_chars: Approximate total character count for the haystack.
+    Paragraphs are shuffled and NOT repeated within a single test to avoid
+    giving the model positional shortcuts via repeated text.
     """
-    # Build filler text by repeating paragraphs
-    filler_parts: list[str] = []
-    total_chars = 0
+    paragraphs = list(FILLER_PARAGRAPHS)
+    rng.shuffle(paragraphs)
+
+    result: list[str] = []
+    total = 0
     idx = 0
-    while total_chars < target_chars:
-        para = FILLER_PARAGRAPHS[idx % len(FILLER_PARAGRAPHS)]
-        filler_parts.append(para)
-        total_chars += len(para) + 2  # +2 for paragraph breaks
+    while total < target_chars:
+        para = paragraphs[idx % len(paragraphs)]
+        # After exhausting unique paragraphs, we continue cycling but this
+        # only happens for very large contexts (>~100K chars).
+        result.append(para)
+        total += len(para) + 2  # +2 for "\n\n" separator
         idx += 1
+    return result
 
-    filler_text = "\n\n".join(filler_parts)
 
-    # Pre-compute all insertion positions based on original text length to avoid
-    # position drift from earlier insertions shifting byte offsets.
-    original_len = len(filler_text)
-    insertion_plan: list[tuple[Needle, int]] = []
+def _insert_needles_into_paragraphs(
+    paragraphs: list[str],
+    needles: list[Needle],
+) -> str:
+    """Insert needles at their specified depth positions within the paragraph list.
+
+    Depth 0% = before the first paragraph, 100% = after the last paragraph.
+    """
+    n = len(paragraphs)
+    # Build list of (insert_index, needle_sentence) sorted by depth
+    insertions: list[tuple[int, str]] = []
     for needle in needles:
-        insert_pos = int(original_len * needle.position)
-        # Find a paragraph boundary near the insert position
-        newline_pos = filler_text.rfind("\n\n", 0, insert_pos)
-        if newline_pos == -1:
-            newline_pos = insert_pos
-        insertion_plan.append((needle, newline_pos))
+        # Map depth_pct to an index in [0, n]
+        idx = int(needle.depth_pct * n)
+        idx = max(0, min(idx, n))
+        insertions.append((idx, needle.sentence))
 
-    # Insert in reverse order (by position) so earlier insertions don't shift
-    # the byte offsets of later ones.
-    insertion_plan.sort(key=lambda x: x[1], reverse=True)
-    for needle, pos in insertion_plan:
-        filler_text = (
-            filler_text[:pos]
-            + f"\n\n{needle.sentence}\n\n"
-            + filler_text[pos:]
-        )
+    # Insert in reverse order so earlier insertions don't shift indices
+    insertions.sort(key=lambda x: x[0], reverse=True)
+    for idx, sentence in insertions:
+        paragraphs.insert(idx, sentence)
 
-    return filler_text
+    return "\n\n".join(paragraphs)
+
+
+def generate_haystack_single(
+    needle: Needle,
+    target_chars: int,
+    rng: random.Random,
+) -> str:
+    """Generate haystack for single-needle mode."""
+    paragraphs = _build_filler(target_chars, rng)
+    return _insert_needles_into_paragraphs(paragraphs, [needle])
+
+
+def generate_haystack_multi_key(
+    real_needle: Needle,
+    distractors: list[Needle],
+    target_chars: int,
+    rng: random.Random,
+) -> str:
+    """Generate haystack for multi-key mode (real needle + distractors)."""
+    all_needles = [real_needle] + distractors
+    paragraphs = _build_filler(target_chars, rng)
+    return _insert_needles_into_paragraphs(paragraphs, all_needles)
+
+
+def generate_haystack_multi_value(
+    needles: list[Needle],
+    target_chars: int,
+    rng: random.Random,
+) -> str:
+    """Generate haystack for multi-value mode (same key, multiple values)."""
+    paragraphs = _build_filler(target_chars, rng)
+    return _insert_needles_into_paragraphs(paragraphs, needles)
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +696,6 @@ def start_server(
         print(f"  [CMD] {' '.join(cmd)}")
 
     # Always capture stderr to a temp file for debugging, even in non-verbose mode.
-    # In verbose mode we also tee to the console via stdout.
     if verbose:
         stderr_dest = None  # inherit terminal
         stdout_dest = None
@@ -456,23 +783,18 @@ def stop_server(proc: subprocess.Popen) -> None:
 # Query logic
 # ---------------------------------------------------------------------------
 
-def query_needle(
+def _query_server(
     port: int,
-    haystack: str,
-    city: str,
+    user_content: str,
     timeout: int = 300,
     max_retries: int = 3,
 ) -> str:
-    """Send a chat completion request querying a specific needle.
+    """Send a chat completion request and return the content field.
 
-    Returns the model's response text.
+    Scores from content field ONLY (not reasoning_content) — Qwen3.5 thinking
+    mode fix. The reasoning chain may mention other needles' values.
     """
     url = f"http://127.0.0.1:{port}/v1/chat/completions"
-
-    user_content = (
-        f"{haystack}\n\n"
-        f"What is the secret code for {city}? Reply with only the number."
-    )
 
     payload = json.dumps({
         "model": "model",
@@ -480,15 +802,12 @@ def query_needle(
             {"role": "user", "content": user_content},
         ],
         "temperature": 0,
+        "seed": SEED,
         # Qwen3.5 uses thinking mode — needs enough tokens to finish thinking + answer.
-        # The model scans through all text blocks in its reasoning, which can burn
-        # 1000+ tokens before producing the actual answer.
         "max_tokens": 2048,
     }).encode()
 
-    headers = {
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
 
     for attempt in range(max_retries):
         try:
@@ -497,15 +816,10 @@ def query_needle(
                 data = json.loads(resp.read().decode())
                 msg = data["choices"][0]["message"]
                 content = (msg.get("content") or "").strip()
-                # For thinking models (Qwen3.5): content has the actual answer,
-                # reasoning_content has the chain-of-thought. We ONLY score
-                # content — reasoning may mention other needles' codes.
                 if content:
                     # Strip any remaining thinking tags
                     content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
                     return content
-                # If content is empty, model ran out of tokens during thinking.
-                # Return empty — this is a legitimate miss (model couldn't retrieve in time).
                 return ""
         except (urllib.error.URLError, ConnectionError, OSError) as e:
             if attempt < max_retries - 1:
@@ -518,162 +832,306 @@ def query_needle(
     return ""  # unreachable, but keeps mypy happy
 
 
-def score_response(response: str, expected_code: int) -> bool:
-    """Check if the expected 6-digit code is the first 6-digit number in the response.
+def _score_single(response: str, expected: str) -> bool:
+    """Binary scoring: extract first 7-digit number from response, exact match."""
+    match = re.search(r'\b(\d{7})\b', response)
+    return match is not None and match.group(1) == expected
 
-    Uses regex word-boundary match to avoid false positives from partial matches
-    (e.g., matching '123456' inside '1234567').
-    """
-    match = re.search(r'\b(\d{6})\b', response)
-    return match is not None and int(match.group(1)) == expected_code
+
+def _score_multi_value(response: str, expected_values: list[str]) -> list[bool]:
+    """Score multi-value: check which expected values appear in the response."""
+    found_numbers = re.findall(r'\b(\d{7})\b', response)
+    return [val in found_numbers for val in expected_values]
 
 
 # ---------------------------------------------------------------------------
-# Main test runner
+# Test runners by mode
 # ---------------------------------------------------------------------------
 
-def run_config(
-    llama_dir: Path,
-    model_path: Path,
-    cache_type: str,
-    depth: int,
-    needle_count: int,
+def _run_single_trial(
     port: int,
-    verbose: bool = False,
-    server_timeout: int = 120,
-    query_timeout: int = 300,
-    server_bin: Optional[Path] = None,
-    chars_per_token: float = 4.0,
-) -> ConfigResult:
-    """Run NIAH test for one (depth, needle_count, cache_type) configuration."""
-    rng = random.Random(SEED)
-
-    needles = generate_needles(needle_count, rng)
-    # Token estimation: ~chars_per_token chars per token (approximate; override
-    # with --chars-per-token if your model's tokenizer is significantly different).
-    target_chars = int(depth * chars_per_token)
-    if verbose:
-        print(f"  Token estimation: {depth} tokens * {chars_per_token} chars/token = {target_chars:,} chars")
-    haystack = generate_haystack(needles, target_chars)
-
-    if verbose:
-        print(f"\n  Haystack length: {len(haystack):,} chars (~{len(haystack) // int(chars_per_token):,} tokens)")
-        for n in needles:
-            print(f"  Needle: {n.city} = {n.code} @ {n.position:.0%}")
-
-    result = ConfigResult(depth=depth, needle_count=needle_count, cache_type=cache_type)
-
-    print(f"\n  Starting server: cache={cache_type}, ctx={depth}, needles={needle_count}")
-    # Use context size with some headroom for the query + response
-    server_ctx = depth + 4096  # Headroom for query prompt + 2048 response tokens
-    proc = start_server(
-        llama_dir, model_path, cache_type, server_ctx, port, verbose,
-        server_timeout=server_timeout, server_bin_override=server_bin,
+    haystack: str,
+    needle: Needle,
+    timeout: int,
+    verbose: bool,
+) -> TrialResult:
+    """Run one single-needle trial."""
+    user_content = (
+        f"{haystack}\n\n"
+        "What is the special magic number mentioned in the above text? "
+        "Reply with ONLY the number, nothing else."
     )
 
-    try:
-        for needle in needles:
-            print(f"    Querying {needle.city}...", end=" ", flush=True)
-            response = query_needle(port, haystack, needle.city, timeout=query_timeout)
-            found = score_response(response, needle.code)
-            result.trials.append(TrialResult(
-                city=needle.city,
-                expected_code=needle.code,
-                response=response,
-                found=found,
-            ))
-            status = "HIT" if found else "MISS"
-            print(f"{status} (expected={needle.code}, got={response!r})")
-    finally:
-        stop_server(proc)
+    response = _query_server(port, user_content, timeout=timeout)
+    found = _score_single(response, needle.value)
 
-    return result
+    if verbose:
+        status = "HIT" if found else "MISS"
+        print(f"    {status} (expected={needle.value}, got={response!r})")
+
+    return TrialResult(
+        expected=needle.value,
+        response=response,
+        found=found,
+        needle_depth_pct=needle.depth_pct,
+    )
 
 
-def run_all(args: argparse.Namespace) -> list[ConfigResult]:
-    """Run all configurations and return results."""
-    llama_dir = Path(args.llama_dir)
-    model_path = Path(args.model_path)
-    depths = [int(d) for d in args.depths.split(",")]
-    needle_counts = [int(n) for n in args.needles.split(",")]
+def run_single_mode(
+    args: argparse.Namespace,
+    llama_dir: Path,
+    model_path: Path,
+) -> list[ConfigResult]:
+    """Kamradt single-needle: sweep depth (0-100%) x context length."""
+    depths_sweep = [int(d) for d in args.depths_sweep.split(",")]
+    context_lengths = [int(d) for d in args.depths.split(",")]
     cache_types = [c.strip() for c in args.cache_types.split(",")]
     port = int(args.port)
+    server_bin = Path(args.server_bin) if args.server_bin else None
 
-    # Validate needle counts against available cities
-    max_needles = max(needle_counts)
-    if max_needles > len(CITIES):
-        print(
-            f"Error: --needles includes {max_needles} but only {len(CITIES)} cities "
-            f"are available. Reduce needle count or add more cities.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    # Resolve server binary
-    server_bin: Optional[Path] = None
-    if args.server_bin:
-        server_bin = Path(args.server_bin)
-        if not server_bin.exists():
-            print(f"Error: server binary not found at {server_bin}", file=sys.stderr)
-            sys.exit(1)
-    else:
-        # Validate paths
-        if not llama_dir.exists():
-            print(f"Error: llama.cpp directory not found: {llama_dir}", file=sys.stderr)
-            sys.exit(1)
-        default_bin = llama_dir / "build" / "bin" / "llama-server"
-        if not default_bin.exists():
-            print(f"Error: llama-server not found at {default_bin}", file=sys.stderr)
-            sys.exit(1)
-
-    if not model_path.exists():
-        print(f"Error: model file not found: {model_path}", file=sys.stderr)
-        sys.exit(1)
-
-    total_configs = len(depths) * len(needle_counts) * len(cache_types)
-    print(f"NIAH Test: {total_configs} configurations")
-    print(f"  Model: {model_path.name}")
-    print(f"  Depths: {depths}")
-    print(f"  Needle counts: {needle_counts}")
+    total = len(depths_sweep) * len(context_lengths) * len(cache_types)
+    print(f"\nSingle-needle mode: {total} configurations")
+    print(f"  Depth sweep: {depths_sweep}")
+    print(f"  Context lengths: {context_lengths}")
     print(f"  Cache types: {cache_types}")
-    print(f"  Port: {port}")
-    print(f"  Seed: {SEED}")
-    print(f"  Chars/token: {args.chars_per_token}")
 
     results: list[ConfigResult] = []
     config_num = 0
 
-    for depth in depths:
-        for needle_count in needle_counts:
-            for cache_type in cache_types:
-                config_num += 1
-                print(f"\n{'='*60}")
-                print(f"Config {config_num}/{total_configs}: "
-                      f"depth={depth}, needles={needle_count}, cache={cache_type}")
-                print(f"{'='*60}")
+    for cache_type in cache_types:
+        for ctx_len in context_lengths:
+            # Start server once per (cache_type, ctx_len) — reuse for all depths
+            server_ctx = ctx_len + 4096  # headroom for query + response
+            actual_port = _find_free_port(port)
+            print(f"\n  Starting server: cache={cache_type}, ctx={server_ctx}")
+            proc = start_server(
+                llama_dir, model_path, cache_type, server_ctx, actual_port,
+                args.verbose, server_timeout=args.server_timeout,
+                server_bin_override=server_bin,
+            )
 
-                try:
-                    # Find a free port in case the default is occupied
-                    actual_port = _find_free_port(port)
-                    result = run_config(
-                        llama_dir, model_path, cache_type, depth,
-                        needle_count, actual_port, args.verbose,
-                        server_timeout=args.server_timeout,
-                        query_timeout=args.query_timeout,
-                        server_bin=server_bin,
-                        chars_per_token=args.chars_per_token,
+            try:
+                for depth_pct in depths_sweep:
+                    config_num += 1
+                    rng = random.Random(SEED + depth_pct + ctx_len)
+
+                    needle = Needle(
+                        key="The special magic number is",
+                        value=_make_magic_number(rng),
+                        depth_pct=depth_pct / 100.0,
                     )
-                    results.append(result)
-                    print(f"  Result: {result.accuracy} ({result.accuracy_pct:.0f}%)")
-                except Exception as e:
-                    print(f"  ERROR: {e}", file=sys.stderr)
-                    # Record a failed config with zero hits
-                    failed = ConfigResult(
-                        depth=depth,
-                        needle_count=needle_count,
+
+                    target_chars = int(ctx_len * args.chars_per_token)
+                    haystack = generate_haystack_single(needle, target_chars, rng)
+
+                    ctx_label = f"{ctx_len // 1024}K" if ctx_len >= 1024 else str(ctx_len)
+                    print(f"    [{config_num}/{total}] cache={cache_type} "
+                          f"ctx={ctx_label} depth={depth_pct}%", end=" ", flush=True)
+
+                    trial = _run_single_trial(
+                        actual_port, haystack, needle, args.query_timeout, args.verbose,
+                    )
+                    trial.context_length = ctx_len
+
+                    result = ConfigResult(
+                        mode="single",
+                        context_length=ctx_len,
                         cache_type=cache_type,
+                        needle_depth_pct=depth_pct / 100.0,
                     )
-                    results.append(failed)
+                    result.trials.append(trial)
+                    results.append(result)
+
+                    status = "✅" if trial.found else "❌"
+                    if not args.verbose:
+                        print(status)
+            finally:
+                stop_server(proc)
+
+    return results
+
+
+def run_multi_key_mode(
+    args: argparse.Namespace,
+    llama_dir: Path,
+    model_path: Path,
+) -> list[ConfigResult]:
+    """RULER MK-NIAH: real needle + distractors, sweep context length."""
+    context_lengths = [int(d) for d in args.depths.split(",")]
+    cache_types = [c.strip() for c in args.cache_types.split(",")]
+    num_distractors = args.num_distractors
+    port = int(args.port)
+    server_bin = Path(args.server_bin) if args.server_bin else None
+
+    total = len(context_lengths) * len(cache_types)
+    print(f"\nMulti-key mode: {total} configurations, {num_distractors} distractors each")
+    print(f"  Context lengths: {context_lengths}")
+    print(f"  Cache types: {cache_types}")
+
+    results: list[ConfigResult] = []
+    config_num = 0
+
+    for cache_type in cache_types:
+        for ctx_len in context_lengths:
+            config_num += 1
+            rng = random.Random(SEED + ctx_len)
+
+            # Real needle at 50% depth
+            real_needle = Needle(
+                key="The special magic number is",
+                value=_make_magic_number(rng),
+                depth_pct=0.5,
+            )
+
+            # Distractor needles spread evenly
+            distractors: list[Needle] = []
+            for i in range(num_distractors):
+                d_key = DISTRACTOR_KEYS[i % len(DISTRACTOR_KEYS)]
+                d_pos = (i + 1) / (num_distractors + 2)  # spread across 0-1
+                distractors.append(Needle(
+                    key=d_key,
+                    value=_make_magic_number(rng),
+                    depth_pct=d_pos,
+                ))
+
+            target_chars = int(ctx_len * args.chars_per_token)
+            haystack = generate_haystack_multi_key(real_needle, distractors, target_chars, rng)
+
+            server_ctx = ctx_len + 4096
+            actual_port = _find_free_port(port)
+            ctx_label = f"{ctx_len // 1024}K" if ctx_len >= 1024 else str(ctx_len)
+            print(f"\n  [{config_num}/{total}] cache={cache_type} ctx={ctx_label}", end=" ", flush=True)
+
+            proc = start_server(
+                llama_dir, model_path, cache_type, server_ctx, actual_port,
+                args.verbose, server_timeout=args.server_timeout,
+                server_bin_override=server_bin,
+            )
+
+            try:
+                user_content = (
+                    f"{haystack}\n\n"
+                    "What is the special magic number mentioned in the above text? "
+                    "Reply with ONLY the number, nothing else."
+                )
+                response = _query_server(actual_port, user_content, timeout=args.query_timeout)
+                found = _score_single(response, real_needle.value)
+
+                trial = TrialResult(
+                    expected=real_needle.value,
+                    response=response,
+                    found=found,
+                    needle_depth_pct=0.5,
+                    context_length=ctx_len,
+                )
+
+                result = ConfigResult(
+                    mode="multi-key",
+                    context_length=ctx_len,
+                    cache_type=cache_type,
+                    needle_depth_pct=0.5,
+                    needle_count=1 + num_distractors,
+                )
+                result.trials.append(trial)
+                results.append(result)
+
+                status = "✅" if found else "❌"
+                print(status)
+                if args.verbose:
+                    print(f"    expected={real_needle.value}, got={response!r}")
+            finally:
+                stop_server(proc)
+
+    return results
+
+
+def run_multi_value_mode(
+    args: argparse.Namespace,
+    llama_dir: Path,
+    model_path: Path,
+) -> list[ConfigResult]:
+    """RULER MV-NIAH: multiple same-key needles, sweep length x count."""
+    context_lengths = [int(d) for d in args.depths.split(",")]
+    cache_types = [c.strip() for c in args.cache_types.split(",")]
+    value_counts = [int(n) for n in args.value_counts.split(",")]
+    port = int(args.port)
+    server_bin = Path(args.server_bin) if args.server_bin else None
+
+    total = len(context_lengths) * len(cache_types) * len(value_counts)
+    print(f"\nMulti-value mode: {total} configurations")
+    print(f"  Context lengths: {context_lengths}")
+    print(f"  Value counts: {value_counts}")
+    print(f"  Cache types: {cache_types}")
+
+    results: list[ConfigResult] = []
+    config_num = 0
+
+    for cache_type in cache_types:
+        for ctx_len in context_lengths:
+            server_ctx = ctx_len + 4096
+            actual_port = _find_free_port(port)
+            print(f"\n  Starting server: cache={cache_type}, ctx={server_ctx}")
+            proc = start_server(
+                llama_dir, model_path, cache_type, server_ctx, actual_port,
+                args.verbose, server_timeout=args.server_timeout,
+                server_bin_override=server_bin,
+            )
+
+            try:
+                for vc in value_counts:
+                    config_num += 1
+                    rng = random.Random(SEED + ctx_len + vc)
+
+                    # Create vc needles with the same key at different positions
+                    needles: list[Needle] = []
+                    for i in range(vc):
+                        pos = (i + 1) / (vc + 1)  # spread evenly
+                        needles.append(Needle(
+                            key="The special magic number is",
+                            value=_make_magic_number(rng),
+                            depth_pct=pos,
+                        ))
+
+                    target_chars = int(ctx_len * args.chars_per_token)
+                    haystack = generate_haystack_multi_value(needles, target_chars, rng)
+
+                    ctx_label = f"{ctx_len // 1024}K" if ctx_len >= 1024 else str(ctx_len)
+                    print(f"    [{config_num}/{total}] cache={cache_type} "
+                          f"ctx={ctx_label} values={vc}", end=" ", flush=True)
+
+                    user_content = (
+                        f"{haystack}\n\n"
+                        "What are ALL the special magic numbers mentioned in the above text? "
+                        "Reply with ONLY the numbers separated by commas, nothing else."
+                    )
+                    response = _query_server(actual_port, user_content, timeout=args.query_timeout)
+                    expected_values = [n.value for n in needles]
+                    hits = _score_multi_value(response, expected_values)
+
+                    result = ConfigResult(
+                        mode="multi-value",
+                        context_length=ctx_len,
+                        cache_type=cache_type,
+                        needle_count=vc,
+                    )
+
+                    for needle, hit in zip(needles, hits):
+                        result.trials.append(TrialResult(
+                            expected=needle.value,
+                            response=response,
+                            found=hit,
+                            needle_depth_pct=needle.depth_pct,
+                            context_length=ctx_len,
+                        ))
+                    results.append(result)
+
+                    hit_count = sum(hits)
+                    status = "✅" if all(hits) else f"⚠️ {hit_count}/{vc}"
+                    print(status)
+                    if args.verbose:
+                        print(f"    expected={expected_values}, got={response!r}")
+            finally:
+                stop_server(proc)
 
     return results
 
@@ -682,96 +1140,275 @@ def run_all(args: argparse.Namespace) -> list[ConfigResult]:
 # Output formatting
 # ---------------------------------------------------------------------------
 
-def build_table(results: list[ConfigResult], model_name: str) -> str:
-    """Build a markdown comparison table from results."""
-    # Group results by (depth, needle_count)
-    cache_types = sorted(set(r.cache_type for r in results))
-    lookup: dict[tuple[int, int, str], ConfigResult] = {}
-    for r in results:
-        lookup[(r.depth, r.needle_count, r.cache_type)] = r
+def _build_heatmap_table(
+    results: list[ConfigResult],
+    cache_type: str,
+    model_name: str,
+) -> str:
+    """Build a 2D heatmap table (depth rows x length columns) for single mode."""
+    # Filter results for this cache type
+    ct_results = [r for r in results if r.cache_type == cache_type]
+    if not ct_results:
+        return f"## Single Needle Retrieval: {cache_type}\n\n(no results)\n"
 
-    depths = sorted(set(r.depth for r in results))
-    needle_counts = sorted(set(r.needle_count for r in results))
+    depths = sorted(set(int(r.needle_depth_pct * 100) for r in ct_results))
+    lengths = sorted(set(r.context_length for r in ct_results))
+
+    # Build lookup: (depth_pct_int, ctx_len) -> passed
+    lookup: dict[tuple[int, int], Optional[bool]] = {}
+    for r in ct_results:
+        d = int(r.needle_depth_pct * 100)
+        lookup[(d, r.context_length)] = r.passed
+
+    # Header
+    len_labels = []
+    for l in lengths:
+        len_labels.append(f"{l // 1024}K" if l >= 1024 else str(l))
+
+    header = "| Depth  |"
+    sep = "|--------|"
+    for label in len_labels:
+        header += f" {label:<5}|"
+        sep += f"------|"
 
     lines = [
-        f"## NIAH Results: {model_name}",
-        "",
-        "| Context | Needles |",
-    ]
-
-    # Build header dynamically based on cache types
-    header = "| Context | Needles |"
-    separator = "|---------|---------|"
-    for ct in cache_types:
-        header += f" {ct} |"
-        separator += f"{'─' * (max(len(ct), 6) + 2)}|"
-
-    # Delta column only makes sense when comparing exactly 2 cache types
-    if len(cache_types) == 2:
-        header += " Delta |"
-        separator += "-------|"
-
-    lines = [
-        f"## NIAH Results: {model_name}",
+        f"## Single Needle Retrieval: {cache_type}",
         "",
         header,
-        separator,
+        sep,
     ]
 
-    for depth in depths:
-        depth_label = f"{depth // 1024}K" if depth >= 1024 else str(depth)
-        for nc in needle_counts:
-            row = f"| {depth_label:<7} | {nc:<7} |"
-            pcts = []
-            for ct in cache_types:
-                r = lookup.get((depth, nc, ct))
-                if r and r.trials:
-                    row += f" {r.accuracy:<{max(len(ct), 6)}} |"
-                    pcts.append(r.accuracy_pct)
-                else:
-                    row += f" {'ERR':<{max(len(ct), 6)}} |"
-                    pcts.append(None)
-
-            if len(cache_types) == 2 and all(p is not None for p in pcts):
-                delta = pcts[1] - pcts[0]  # type: ignore[operator]
-                sign = "+" if delta > 0 else ""
-                row += f" {sign}{delta:.0f}%   |"
-            elif len(cache_types) == 2:
-                row += " N/A   |"
-
-            lines.append(row)
+    for d in depths:
+        row = f"| {d:<4}%  |"
+        for l in lengths:
+            val = lookup.get((d, l))
+            if val is None:
+                cell = " ERR "
+            elif val:
+                cell = " ✅   "
+            else:
+                cell = " ❌   "
+            row += f"{cell}|"
+        lines.append(row)
 
     return "\n".join(lines)
+
+
+def _build_delta_table(
+    results: list[ConfigResult],
+    baseline: str,
+    compare: str,
+) -> str:
+    """Build a delta table showing where compare differs from baseline."""
+    base_results = {
+        (int(r.needle_depth_pct * 100), r.context_length): r.passed
+        for r in results if r.cache_type == baseline
+    }
+    comp_results = {
+        (int(r.needle_depth_pct * 100), r.context_length): r.passed
+        for r in results if r.cache_type == compare
+    }
+
+    if not base_results or not comp_results:
+        return ""
+
+    depths = sorted(set(k[0] for k in base_results))
+    lengths = sorted(set(k[1] for k in base_results))
+
+    len_labels = [f"{l // 1024}K" if l >= 1024 else str(l) for l in lengths]
+
+    header = "| Depth  |"
+    sep = "|--------|"
+    for label in len_labels:
+        header += f" {label:<5}|"
+        sep += f"------|"
+
+    lines = [
+        f"## Delta: {compare} vs {baseline}",
+        "",
+        header,
+        sep,
+    ]
+
+    has_diff = False
+    for d in depths:
+        row = f"| {d:<4}%  |"
+        for l in lengths:
+            b = base_results.get((d, l))
+            c = comp_results.get((d, l))
+            if b is None or c is None:
+                cell = " N/A "
+            elif b == c:
+                cell = "  =  "
+            elif c and not b:
+                cell = " +🟢 "
+                has_diff = True
+            else:
+                cell = " -🔴 "
+                has_diff = True
+            row += f"{cell}|"
+        lines.append(row)
+
+    if not has_diff:
+        lines.append("")
+        lines.append("No differences detected.")
+
+    return "\n".join(lines)
+
+
+def _build_multi_key_table(
+    results: list[ConfigResult],
+    model_name: str,
+) -> str:
+    """Build table for multi-key mode results."""
+    cache_types = sorted(set(r.cache_type for r in results))
+    lengths = sorted(set(r.context_length for r in results))
+
+    len_labels = [f"{l // 1024}K" if l >= 1024 else str(l) for l in lengths]
+
+    header = "| Cache Type |"
+    sep = "|------------|"
+    for label in len_labels:
+        header += f" {label:<5}|"
+        sep += f"------|"
+
+    lines = [
+        f"## Multi-Key Retrieval (MK-NIAH)",
+        "",
+        header,
+        sep,
+    ]
+
+    lookup: dict[tuple[str, int], bool] = {}
+    for r in results:
+        lookup[(r.cache_type, r.context_length)] = r.passed
+
+    for ct in cache_types:
+        row = f"| {ct:<10} |"
+        for l in lengths:
+            val = lookup.get((ct, l))
+            if val is None:
+                cell = " ERR "
+            elif val:
+                cell = " ✅   "
+            else:
+                cell = " ❌   "
+            row += f"{cell}|"
+        lines.append(row)
+
+    return "\n".join(lines)
+
+
+def _build_multi_value_table(
+    results: list[ConfigResult],
+    model_name: str,
+) -> str:
+    """Build table for multi-value mode results."""
+    cache_types = sorted(set(r.cache_type for r in results))
+    lengths = sorted(set(r.context_length for r in results))
+    value_counts = sorted(set(r.needle_count for r in results))
+
+    lines = [f"## Multi-Value Retrieval (MV-NIAH)", ""]
+
+    for ct in cache_types:
+        len_labels = [f"{l // 1024}K" if l >= 1024 else str(l) for l in lengths]
+
+        header = "| Values |"
+        sep = "|--------|"
+        for label in len_labels:
+            header += f" {label:<7}|"
+            sep += f"--------|"
+
+        lines.extend([f"### {ct}", "", header, sep])
+
+        lookup: dict[tuple[int, int], float] = {}
+        for r in results:
+            if r.cache_type == ct:
+                lookup[(r.needle_count, r.context_length)] = r.accuracy_pct
+
+        for vc in value_counts:
+            row = f"| {vc:<6} |"
+            for l in lengths:
+                pct = lookup.get((vc, l))
+                if pct is None:
+                    cell = " ERR    "
+                elif pct == 100.0:
+                    cell = " ✅ 100%"
+                elif pct == 0.0:
+                    cell = " ❌   0%"
+                else:
+                    cell = f" ⚠️ {pct:3.0f}%"
+                row += f"{cell}|"
+            lines.append(row)
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def build_output(results: list[ConfigResult], model_name: str, mode: str) -> str:
+    """Build the full markdown output for the given mode."""
+    parts = [
+        f"# TurboQuant NIAH Benchmark: {model_name}",
+        f"Mode: {mode} | Seed: {SEED} | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        "",
+    ]
+
+    if mode == "single":
+        cache_types = sorted(set(r.cache_type for r in results))
+        for ct in cache_types:
+            parts.append(_build_heatmap_table(results, ct, model_name))
+            parts.append("")
+
+        # Delta table if we have exactly 2 cache types
+        if len(cache_types) == 2:
+            parts.append(_build_delta_table(results, cache_types[0], cache_types[1]))
+            parts.append("")
+
+    elif mode == "multi-key":
+        parts.append(_build_multi_key_table(results, model_name))
+        parts.append("")
+
+    elif mode == "multi-value":
+        parts.append(_build_multi_value_table(results, model_name))
+        parts.append("")
+
+    return "\n".join(parts)
 
 
 def save_results(
     results: list[ConfigResult],
     model_name: str,
+    mode: str,
     output_dir: Path,
 ) -> tuple[Path, Path]:
-    """Save results as JSON and markdown table."""
+    """Save results as JSON and markdown."""
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     # JSON results
-    json_path = output_dir / f"niah_results_{timestamp}.json"
+    json_path = output_dir / f"niah_{mode}_{timestamp}.json"
     json_data = {
         "model": model_name,
+        "mode": mode,
         "seed": SEED,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "results": [
             {
-                "depth": r.depth,
-                "needle_count": r.needle_count,
+                "mode": r.mode,
+                "context_length": r.context_length,
                 "cache_type": r.cache_type,
-                "accuracy": r.accuracy,
+                "needle_depth_pct": r.needle_depth_pct,
+                "needle_count": r.needle_count,
                 "accuracy_pct": r.accuracy_pct,
+                "passed": r.passed,
                 "trials": [
                     {
-                        "city": t.city,
-                        "expected_code": t.expected_code,
+                        "expected": t.expected,
                         "response": t.response,
                         "found": t.found,
+                        "needle_depth_pct": t.needle_depth_pct,
+                        "context_length": t.context_length,
                     }
                     for t in r.trials
                 ],
@@ -782,11 +1419,11 @@ def save_results(
     with open(json_path, "w") as f:
         json.dump(json_data, f, indent=2)
 
-    # Markdown table
-    md_path = output_dir / f"niah_results_{timestamp}.md"
-    table = build_table(results, model_name)
+    # Markdown
+    md_path = output_dir / f"niah_{mode}_{timestamp}.md"
+    md_content = build_output(results, model_name, mode)
     with open(md_path, "w") as f:
-        f.write(table + "\n")
+        f.write(md_content + "\n")
 
     return json_path, md_path
 
@@ -797,14 +1434,19 @@ def save_results(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="TurboQuant Needle-In-A-Haystack (NIAH) test. "
-        "Measures retrieval accuracy across cache types, context depths, and needle counts.",
+        description="TurboQuant NIAH Benchmark v2 — Kamradt + RULER methodology.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
+            Modes:
+              single       Kamradt single-needle: sweep depth (0-100%%) x context length
+              multi-key    RULER MK-NIAH: real needle + distractors, sweep context length
+              multi-value  RULER MV-NIAH: multiple same-key needles, sweep length x count
+
             Examples:
               python3 scripts/niah_test.py /path/to/llama.cpp /path/to/model.gguf
-              python3 scripts/niah_test.py /path/to/llama.cpp /path/to/model.gguf --depths 4096,8192 --needles 1,5
-              python3 scripts/niah_test.py /path/to/llama.cpp /path/to/model.gguf --cache-types q8_0 --verbose
+              python3 scripts/niah_test.py /path/to/llama.cpp /path/to/model.gguf --mode single
+              python3 scripts/niah_test.py /path/to/llama.cpp /path/to/model.gguf --mode multi-key --num-distractors 5
+              python3 scripts/niah_test.py /path/to/llama.cpp /path/to/model.gguf --mode multi-value --value-counts 2,4,8
         """),
     )
 
@@ -819,14 +1461,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path to the GGUF model file (required)",
     )
     parser.add_argument(
-        "--depths",
-        default="4096,8192,16384,32768",
-        help="Comma-separated context depths to test (default: %(default)s)",
+        "--mode",
+        choices=["single", "multi-key", "multi-value"],
+        default="single",
+        help="Test mode (default: %(default)s)",
     )
     parser.add_argument(
-        "--needles",
-        default="1,5,10",
-        help="Comma-separated needle counts to test (default: %(default)s)",
+        "--depths",
+        default="4096,8192,16384,32768",
+        help="Comma-separated context lengths in tokens (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--depths-sweep",
+        default="0,10,20,30,40,50,60,70,80,90,100",
+        help="Comma-separated needle depth positions in %% for single mode (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--cache-types",
+        default="q8_0,turbo3",
+        help="Comma-separated cache types to test (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--num-distractors",
+        type=int,
+        default=3,
+        help="Number of distractor needles for multi-key mode (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--value-counts",
+        default="2,4,8",
+        help="Comma-separated value counts for multi-value mode (default: %(default)s)",
     )
     parser.add_argument(
         "--port",
@@ -839,14 +1503,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Directory for results files (default: ./niah_results/)",
     )
     parser.add_argument(
-        "--cache-types",
-        default="q8_0,turbo3",
-        help="Comma-separated cache types to test (default: %(default)s)",
-    )
-    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
-        help="Show server output and detailed needle info",
+        help="Show server output and detailed info",
     )
     parser.add_argument(
         "--server-timeout",
@@ -864,15 +1523,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--server-bin",
         default=None,
-        help="Path to a specific llama-server binary (e.g., ROCm build, Windows .exe). "
+        help="Path to a specific llama-server binary. "
              "Overrides the default <llama_dir>/build/bin/llama-server.",
     )
     parser.add_argument(
         "--chars-per-token",
         type=float,
         default=4.0,
-        help="Approximate characters per token for haystack sizing (default: %(default)s). "
-             "Override if your model's tokenizer differs significantly (e.g., 3.5 for CJK-heavy models).",
+        help="Approximate characters per token for haystack sizing (default: %(default)s).",
     )
 
     return parser.parse_args(argv)
@@ -890,26 +1548,58 @@ def main(argv: list[str] | None = None) -> None:
         )
         sys.exit(1)
 
-    # Resolve output dir
+    llama_dir = Path(args.llama_dir)
+    model_path = Path(args.model_path)
+
+    # Validate paths
+    server_bin: Optional[Path] = None
+    if args.server_bin:
+        server_bin = Path(args.server_bin)
+        if not server_bin.exists():
+            print(f"Error: server binary not found at {server_bin}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        if not llama_dir.exists():
+            print(f"Error: llama.cpp directory not found: {llama_dir}", file=sys.stderr)
+            sys.exit(1)
+        default_bin = llama_dir / "build" / "bin" / "llama-server"
+        if not default_bin.exists():
+            print(f"Error: llama-server not found at {default_bin}", file=sys.stderr)
+            sys.exit(1)
+
+    if not model_path.exists():
+        print(f"Error: model file not found: {model_path}", file=sys.stderr)
+        sys.exit(1)
+
     if args.output_dir is None:
         args.output_dir = "niah_results"
     output_dir = Path(args.output_dir)
+    model_name = model_path.stem
 
-    model_name = Path(args.model_path).stem
-
-    print(f"{'='*60}")
-    print(f"  TurboQuant NIAH Test")
+    print(f"{'=' * 60}")
+    print(f"  TurboQuant NIAH Benchmark v2")
+    print(f"  Mode: {args.mode}")
+    print(f"  Model: {model_name}")
     print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
-    results = run_all(args)
+    # Dispatch to mode-specific runner
+    if args.mode == "single":
+        results = run_single_mode(args, llama_dir, model_path)
+    elif args.mode == "multi-key":
+        results = run_multi_key_mode(args, llama_dir, model_path)
+    elif args.mode == "multi-value":
+        results = run_multi_value_mode(args, llama_dir, model_path)
+    else:
+        print(f"Error: unknown mode {args.mode}", file=sys.stderr)
+        sys.exit(1)
 
-    # Print table
-    table = build_table(results, model_name)
-    print(f"\n\n{table}\n")
+    # Print output
+    output = build_output(results, model_name, args.mode)
+    print(f"\n\n{output}\n")
 
     # Save results
-    json_path, md_path = save_results(results, model_name, output_dir)
+    json_path, md_path = save_results(results, model_name, args.mode, output_dir)
     print(f"\nResults saved to:")
     print(f"  JSON: {json_path}")
     print(f"  Table: {md_path}")
