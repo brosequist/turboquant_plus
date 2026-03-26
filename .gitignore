@@ -17,3 +17,5 @@ coverage.xml
 *.so
 *.dylib
 .ipynb_checkpoints/
+niah_reference_v1/
+niah_results*/
