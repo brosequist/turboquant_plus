@@ -68,7 +68,15 @@ PPL: 6.211 (unchanged across all variants).
 | 6 | Precomputed centroid*norm | — | — | — | +2% | marginal |
 | 7 | fp16 LUT both paths | — | — | — | -10% | worse |
 | 8 | Custom GGML_OP_TURBO_WHT | — | — | — | -7% | net negative |
+| **9** | **cn[] precomputed registers** | **76.4** | **61.1** | — | **-10.5%** | **REVERT — register spill** |
+| 8 | Custom GGML_OP_TURBO_WHT | — | — | — | -7% | net negative |
+
+## Dead End: Precomputed cn[] Registers (Experiment 9)
+
+Precomputed `cn[8] = {centroid[i]*norm}` into local float array in non-vec dequant. Helps prefill +3% but **destroys decode -10.5%**. The 8-float local array causes register spill that propagates through the Metal shader's flash attention template compilation. Even though only the non-vec function was changed, the vec kernel's register allocation is affected.
+
+**DO NOT precompute centroid values into local arrays in the Metal shader.** Register pressure from even 8 floats causes cross-function spill in flash attention.
 
 ## Recommendation
 
-**Merge the "half LUT + float norm broadcast" to main.** It's the best decode speed achievable within the current dequant function interface. +4.5% to +16.2% vs main, zero regressions.
+**Main branch (half LUT + float norm broadcast) is optimal.** 9 experiments tested, 2 merged (#1 fp16 LUT, #2 float norm broadcast). The remaining 28% decode gap at 48K is irreducible within the current dequant function interface. Further improvement requires fused compressed attention (custom FA kernel).
