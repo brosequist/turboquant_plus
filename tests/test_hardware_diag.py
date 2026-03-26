@@ -271,7 +271,7 @@ class TestFullRun:
         with open(script_path) as f:
             content = f.read()
         assert "[BENCH_END]" in content
-        assert "wall_ms=" in content
+        assert "wall_sec=" in content
 
     def test_ppl_section_present(self, run_diag):
         """PPL section ran (with mock wikitext)."""

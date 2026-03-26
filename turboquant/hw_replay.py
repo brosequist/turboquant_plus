@@ -220,6 +220,45 @@ class HardwareProfile:
         return ratios
 
 
+    def find_decode_inflection(self, cache_type: str = "turbo3") -> Optional[int]:
+        """Find context depth where decode ratio drops most steeply.
+
+        Returns the depth where the gradient (ratio change per depth doubling)
+        is most negative, indicating constant cache thrashing onset.
+        Returns None if insufficient data.
+        """
+        ratios = self.get_ratio_curve(cache_type, "q8_0", "decode")
+        if len(ratios) < 3:
+            return None
+
+        depths = sorted(ratios.keys())
+        worst_gradient = 0.0
+        inflection_depth = None
+
+        for i in range(1, len(depths)):
+            d0, d1 = depths[i - 1], depths[i]
+            r0, r1 = ratios[d0], ratios[d1]
+            if d0 > 0 and d1 > d0:
+                # Gradient: ratio change per context doubling
+                gradient = (r1 - r0) / (d1 - d0) * d0  # normalized
+                if gradient < worst_gradient:
+                    worst_gradient = gradient
+                    inflection_depth = d1
+
+        return inflection_depth
+
+    def flag_unreliable_measurements(self) -> list[str]:
+        """Flag measurements at 1K context (Metal async dispatch artifact)."""
+        warnings = []
+        for b in self.benchmarks:
+            if b.context_depth == 1024 and b.tok_per_sec > 10000:
+                warnings.append(
+                    f"Unreliable measurement: {b.label} at 1K context "
+                    f"({b.tok_per_sec:.0f} tok/s — Metal async dispatch artifact)"
+                )
+        return warnings
+
+
 def parse_diag_output(text: str) -> HardwareProfile:
     """Parse raw turbo-hardware-diag.sh output into a HardwareProfile."""
     profile = HardwareProfile()
@@ -640,7 +679,7 @@ def predict_decode_from_baseline(baseline: HardwareProfile,
 
     The model: constant cache throughput scales with GPU generation.
     M1 (family 1007): ~3x worse constant cache than M5 (family 1010)
-    for divergent access patterns.
+    for divergent access patterns. Missing Tensor API adds additional penalty.
     """
     base_ratios = baseline.get_ratio_curve("turbo3", "q8_0", "decode")
     if not base_ratios:
@@ -648,7 +687,6 @@ def predict_decode_from_baseline(baseline: HardwareProfile,
 
     # Simple constant cache degradation model:
     # Higher GPU family = better constant cache handling
-    # Each generation roughly halves the constant cache penalty
     base_family = baseline.system.gpu.family_id
     if base_family == 0 or target_gpu_family_id == 0:
         return base_ratios  # Can't predict without family info
@@ -656,21 +694,28 @@ def predict_decode_from_baseline(baseline: HardwareProfile,
     # Family ID gap (e.g., 1010 - 1007 = 3 generations)
     gen_gap = base_family - target_gpu_family_id
 
+    # Tensor API penalty: lacking tensor API means older Metal shader paths,
+    # smaller constant cache, worse divergent access handling
+    tensor_penalty = 1.0
+    if baseline.system.gpu.has_tensor and not target_has_tensor:
+        tensor_penalty = 1.3  # 30% additional overhead for missing tensor API
+
     # Degradation factor per context depth:
     # At short context, constant cache isn't the bottleneck (minimal degradation)
-    # At long context, each generation gap doubles the penalty
+    # At long context, each generation gap increases the penalty exponentially
     predicted = {}
     for depth, ratio in base_ratios.items():
         # How much of the speed loss is from constant cache vs inherent overhead
         inherent_overhead = 1.0 - ratio  # e.g., 0.08 at 0.92x
-        # Constant cache portion grows with context
-        cache_fraction = min(1.0, depth / 32768)  # 0 at short, 1.0 at 32K+
+        # Constant cache portion grows with context (exponential, not linear)
+        # Real data shows exponential degradation at long context
+        cache_fraction = min(1.0, (depth / 16384) ** 1.5) if depth > 0 else 0.0
         cache_penalty = inherent_overhead * cache_fraction
         non_cache_penalty = inherent_overhead - cache_penalty
 
-        # Scale cache penalty by generation gap
+        # Scale cache penalty by generation gap + tensor API penalty
         # Each generation ~1.5-2x worse for divergent constant access
-        scaled_cache_penalty = cache_penalty * (1.8 ** gen_gap)
+        scaled_cache_penalty = cache_penalty * (1.8 ** gen_gap) * tensor_penalty
 
         predicted_ratio = max(0.01, 1.0 - non_cache_penalty - scaled_cache_penalty)
         predicted[depth] = round(predicted_ratio, 3)

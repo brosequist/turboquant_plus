@@ -8,8 +8,9 @@
 # Usage:
 #   bash turbo-hardware-diag.sh [path-to-llama-cpp] [path-to-model.gguf]
 #
-# Output: turbo-diag-<date>.json  (machine-parseable)
-#         turbo-diag-<date>.txt   (human-readable log)
+# Output: turbo-diag-<date>.zip  (send this to the team)
+#   Contains: turbo-diag-<date>.txt (human-readable log)
+#             turbo-hwprofile-<date>.json (machine-parseable hardware profile)
 #
 # Tests:
 #   1. Hardware inventory (GPU, memory, thermals, no PII)
@@ -48,7 +49,6 @@ fi
 
 DATE=$(date +%Y%m%d-%H%M%S)
 OUTFILE="turbo-diag-${DATE}.txt"
-JSONFILE="turbo-diag-${DATE}.json"
 
 # --- Validate tools exist ---
 for tool in "$BENCH" "$PERPL" "$CLI"; do
@@ -147,12 +147,11 @@ run_bench() {
 
     subsection "$label"
     echo "[BENCH_START] label=\"$label\" ctk=$ctk ctv=$ctv args=\"$extra_args\" env=\"$env_prefix\" timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    local start_ms
-    start_ms=$(date +%s%3N 2>/dev/null || date +%s)
+    local start_s end_s
+    start_s=$(date +%s)
     eval "${env_prefix} ${BENCH} -m \"${MODEL}\" -ngl 99 -fa 1 -ctk ${ctk} -ctv ${ctv} ${extra_args} -r 3 2>&1" || echo "FAILED: $label"
-    local end_ms
-    end_ms=$(date +%s%3N 2>/dev/null || date +%s)
-    echo "[BENCH_END] label=\"$label\" wall_ms=$((end_ms - start_ms))"
+    end_s=$(date +%s)
+    echo "[BENCH_END] label=\"$label\" wall_sec=$((end_s - start_s))"
 }
 
 run_perpl() {
@@ -170,7 +169,7 @@ run_perpl() {
 
 # ===================================================================
 echo "TurboQuant Hardware Diagnostic v3"
-echo "Output: $OUTFILE (human-readable) + $JSONFILE (machine-parseable)"
+echo "Output: $OUTFILE (human-readable log, zipped at end)"
 echo "Model: $MODEL"
 echo ""
 echo "NO PII is collected. Only hardware specs, load stats, and benchmarks."
@@ -235,8 +234,8 @@ elif [ "$PLATFORM" = "Linux" ]; then
     # ---- Linux ----
     echo "[HW] kernel=$(uname -r)"
     echo "[HW] cpu_brand=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | sed 's/^ //' || echo 'unknown')"
-    echo "[HW] cpu_cores_physical=$(grep -c 'processor' /proc/cpuinfo 2>/dev/null || echo 'unknown')"
-    echo "[HW] cpu_cores_logical=$(nproc 2>/dev/null || echo 'unknown')"
+    echo "[HW] cpu_cores_physical=$(grep 'core id' /proc/cpuinfo 2>/dev/null | sort -u | wc -l | tr -d ' ' || echo 'unknown')"
+    echo "[HW] cpu_cores_logical=$(nproc 2>/dev/null || grep -c 'processor' /proc/cpuinfo 2>/dev/null || echo 'unknown')"
     ram_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo "0")
     echo "[HW] ram_total_bytes=$((ram_kb * 1024))"
     echo "[HW] ram_total_gb=$((ram_kb / 1048576))"
@@ -568,8 +567,8 @@ echo "END OF DIAGNOSTIC"
 # PACKAGE RESULTS
 # ===================================================================
 
-# Stop tee capture before packaging
-exec 1>&1 2>&2
+# Note: tee continues capturing through packaging — this is fine,
+# the zip commands are useful to have in the log too.
 
 echo ""
 echo "Packaging results..."

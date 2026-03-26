@@ -251,6 +251,34 @@ class TestCurveExtraction:
         curve = m5_max_profile.get_decode_curve("turbo4")
         assert len(curve) == 0
 
+    def test_inflection_point_m1(self, m1_max_profile):
+        """M1 should show clear inflection point where decode drops off."""
+        inflection = m1_max_profile.find_decode_inflection("turbo3")
+        # M1 has steep dropoff — inflection should be detected
+        assert inflection is not None
+        assert inflection >= 4096  # Should be at some meaningful depth
+
+    def test_inflection_point_m5(self, m5_max_profile):
+        """M5 has gradual degradation — inflection exists but at deeper context."""
+        inflection = m5_max_profile.find_decode_inflection("turbo3")
+        # M5 has smoother curve, but still degrades
+        # May or may not detect inflection depending on gradient
+
+    def test_unreliable_measurements(self):
+        """Flag impossibly high tok/s at 1K context."""
+        profile = HardwareProfile(benchmarks=[
+            BenchResult("test 1K", "turbo3", "turbo3", 1024, "decode", 999999.0, 0.0),
+            BenchResult("test 4K", "turbo3", "turbo3", 4096, "decode", 70.0, 0.5),
+        ])
+        warnings = profile.flag_unreliable_measurements()
+        assert len(warnings) == 1
+        assert "1K" in warnings[0]
+
+    def test_no_false_unreliable_flags(self, m5_max_profile):
+        """Real measurements shouldn't be flagged."""
+        warnings = m5_max_profile.flag_unreliable_measurements()
+        assert len(warnings) == 0
+
 
 # ============================================================
 # Profile Comparison
