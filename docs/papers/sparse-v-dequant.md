@@ -247,13 +247,37 @@ This confirms that sparse V is a general flash attention optimization, not a Tur
 
 ## 8. Limitations and Future Work
 
+### 7.2 Combined 4-mag LUT + Sparse V on M2 Pro
+
+We hypothesized that 4-mag LUT (K dequant optimization) and sparse V (V dequant optimization) would stack since they address independent bottlenecks. Testing on M2 Pro (Apple8, 200 GB/s bandwidth) confirms:
+
+| Test | turbo3 (4-mag + sparse V) | q8\_0 | ratio |
+|------|--------------------------|-------|-------|
+| Short decode (tg128) | 23.6 tok/s | 32.1 tok/s | **0.73×** |
+| pp8192+tg128 | 189.1 tok/s | 210.1 tok/s | 0.90× |
+| pp16384+tg128 | 155.1 tok/s | 171.9 tok/s | 0.90× |
+
+**Historical progression on M2 Pro decode:**
+
+| Optimization | Decode ratio vs q8\_0 |
+|--------------|-----------------------|
+| Baseline (no optimizations) | 0.45× |
+| + 4-mag LUT | 0.67× |
+| **+ 4-mag LUT + sparse V** | **0.73×** |
+
+The two optimizations stack as predicted. 4-mag reduces K dequant cost (fewer constant memory addresses), sparse V skips V dequant for negligible positions. Combined: M2 Pro decode went from 45% to 73% of q8\_0 — a 62% improvement from the unoptimized baseline. Prefill blended numbers are 90% of q8\_0, consistent with M5 Max results.
+
+Raw logs: [`threshold-ablation-logs/m2_pro_4mag_sparse_v.txt`](../threshold-ablation-logs/m2_pro_4mag_sparse_v.txt).
+
+---
+
+## 8. Limitations and Future Work
+
 **Limitations:**
-- Tested on a single hardware platform (M5 Max). M1/M2 results pending (GPU contention during testing). The relative gains may be *larger* on lower-bandwidth hardware (M1/M2), where dequantization is more dominant relative to bus speed.
 - We perform a threshold ablation in Section 4.7 and find the method is insensitive to $\tau$ across $10^{-4}$ to $10^{-8}$. Perplexity is identical at all values.
 - Short context benefit is modest (+1.4%) because attention is less sparse.
 
 **Future work:**
-- **Combined 4-mag + sparse V on M2:** Expected to stack since they address independent bottlenecks (K and V dequant respectively).
 - **Context-adaptive dispatch:** Compile multiple FA kernel variants, select optimal path based on KV cache size at dispatch time.
 - **Sparse K dequant:** Extend the sparsity concept to K. After a first pass computing approximate attention scores, skip K dequant for positions that won't contribute. Requires two-pass attention or speculative attention.
 - **Non-Apple hardware:** Test on NVIDIA (CUDA) and AMD (ROCm) where the dequant bottleneck profile differs.
