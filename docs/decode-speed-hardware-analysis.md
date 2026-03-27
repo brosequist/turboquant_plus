@@ -134,3 +134,53 @@ These are tracked in GitHub issue #39.
 | M5 impact | Zero regression (uses separate code path) |
 | Remaining gap | 38% to ceiling, needs kernel-level surgery |
 | CUDA comparison | buun gets 97.5% via register LUT (not portable to Metal) |
+
+## Complete Experiment Log (12 approaches, 2026-03-26/27)
+
+### M2 Pro (Apple8, has_tensor=false) — 8K context decode
+
+| # | Approach | tok/s | vs q8_0 | vs Ceiling | Key finding |
+|---|----------|-------|---------|-----------|-------------|
+| — | No-op ceiling | 24.5 | 1.12x | 100% | turbo3 format FASTER than q8_0 (less bandwidth) |
+| **1** | **4-mag LUT + XOR sign** | **15.1** | **0.69x** | **62%** | **Sweet spot: 4 constant addrs, 0 branches** |
+| 2 | Batched byte extract (8-LUT) | 13.7 | 0.63x | 56% | Better byte reading, still 8 addresses |
+| 3 | Inline block in FA loop | 13.5 | 0.62x | 55% | I-cache pressure from expanded inline |
+| 4 | Deferred norm (float4 * norm) | 12.9 | 0.59x | 53% | Loses ILP — norm multiply hides LUT latency |
+| 5 | 2-pair half2 + ternary | 12.0 | 0.55x | 49% | Ternary overhead exceeds 2-addr savings |
+| 6 | Select chain (zero LUT) | 11.9 | 0.54x | 49% | 8 ternaries = 8 branches on Apple8 |
+| 7 | Bit-arithmetic (mul+add) | 11.6 | 0.53x | 47% | 7 ALU > 4 constant reads |
+| 8 | FMA branchless (zero ternary) | 11.4 | 0.52x | 47% | fma doesn't help — same ALU count |
+| — | Main (8-entry constant LUT) | 10.95 | 0.50x | 45% | Baseline — 8-way divergent |
+| 9 | Named-reg ternary select | 10.3 | 0.47x | 42% | 4 uniform reads + 8 branches = worst |
+| 10 | Non-vec FA forced (nl=2) | 10.2 | 0.47x | 42% | Non-vec kernel wrong for single-token decode |
+
+### M5 Max (Apple10, has_tensor=true) — short context decode
+
+All approaches: 75-77 tok/s (M5 uses 8-LUT path, unaffected by TURBO_USE_4MAG).
+No regression from any experiment. q8_0 baseline: 85 tok/s.
+
+### Additional checks
+- **Qwen2 attention bias**: NOT present in Qwen2.5-7B-Instruct model (339 tensors, no attn_q/k/v.bias). The GÖKYILDIZ bug does not apply.
+- **Model-independence**: Profiling pattern (LUT = 25% cost on M2) is consistent across Qwen2.5-7B (M2 Pro) and Qwen3.5-35B-A3B (M5 Max). Architecture-independent.
+- **Non-vec FA (nl=2)**: Faster on M5 (+1.7%) but much worse on M2 (-7%). The non-vec kernel processes batch=1 inefficiently at long context.
+
+### Hardware truth (Apple8/M2 Pro)
+1. **1 divergent constant read < 7 ALU ops** — even with fma()
+2. **Metal compiles ternaries to branches** — not predicated moves like CUDA
+3. **Branches cost MORE than divergent constant reads** — the opposite of CUDA
+4. **Array indexing ALWAYS spills** — Metal's register file is too small for cn[4+]
+5. **4 constant addresses is the sweet spot** — fewer adds branches, more adds thrashing
+6. **Per-element norm multiply provides ILP** — hides constant memory latency
+
+### Papers reviewed for novel approaches
+- AttentionPack (arxiv 2603.23914): validates kernel fusion for attention-aware decompression
+- GlowQ (arxiv 2603.25385): validates group-shared factor caching (+37.4% throughput)
+- Embedding Compression via Spherical Coordinates (2602.00079): same PolarQuant framework, different encoding
+- MKA: Memory-Keyed Attention (2603.20587): learned memory lookup, hardware-aware
+- Scaling Attention via Feature Sparsity (2603.22300): skip negligible attention weights
+
+### Next frontier
+The 4-mag LUT is the dequant-level ceiling. The remaining 38% gap requires:
+1. **Block format change**: embed precomputed centroid×norm in device memory (sequential reads, zero divergence)
+2. **Custom FA kernel**: fuse dequant into attention with restructured computation
+3. **Different quantization scheme**: format designed for Metal's constraints from scratch
