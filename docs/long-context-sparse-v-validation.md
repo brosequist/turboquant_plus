@@ -51,9 +51,9 @@ Skip rate grows with context length because softmax concentrates on fewer positi
 
 ## Interpretation
 
-**Long-context PPL does not regress when sparse V is active.** Results are bit-for-bit identical across all tested context lengths (512 through 32K) on both MoE and dense architectures.
+**Long-context PPL does not regress when sparse V is active.** Results are numerically identical across all tested context lengths (512 through 32K) on both MoE and dense architectures.
 
-This is stronger than expected. Even at 32K where ~90% of V dequantizations are skipped, perplexity is unchanged to 4+ decimal places. This confirms that the skipped positions contribute zero useful signal to the output — they are pure quantization noise.
+Even at 32K where ~90% of V dequantizations are skipped, perplexity is unchanged to 4+ decimal places. This indicates that the skipped positions fall below numerical significance in this setup — their contribution is below the threshold where it could affect output quality.
 
 **The 512-context PPL (6.1756) should be described as a no-regression sanity check, not the main quality validation.** At c=512, sparse V skips ~6% of positions and has no meaningful effect. The true validation is at c=8K+ where skip rates are 28-90% and the optimization is actively changing computation.
 
