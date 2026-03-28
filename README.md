@@ -6,11 +6,15 @@ Implementation of [TurboQuant](https://research.google/blog/turboquant-redefinin
 
 Compresses transformer KV cache **4.6x** using PolarQuant + Walsh-Hadamard rotation. Near q8_0 prefill speed and ~0.9x decode throughput at long context (Apple Silicon).
 
-**Key contribution:** Attention-gated KV cache decoding ("Sparse V") that skips low-weight V positions during inference. Up to +22.8% decode speed at 32K context with no measurable PPL change. Sparse V uses attention weights as a gating signal for computation, skipping work that contributes negligibly to the output. This shifts KV cache optimization from representation-level compression to attention-aware computation.
+**Key contribution:** Attention-gated KV cache decoding ("Sparse V") that skips low-weight V positions during inference. +22.8% decode speed at 32K context, validated on wikitext-103 (50 chunks, CI ±0.021) with no measurable PPL change. Sparse V uses attention weights as a gating signal for computation, skipping work that contributes negligibly to the output.
 
-~1% perplexity increase vs q8_0 due to compression; sparse V introduces no additional degradation. Validated at 32K context on wikitext-103 with 50 chunks (CI ±0.021): sparse V ON/OFF delta = 0.000. **Not TurboQuant-specific** — validated across q8_0, q4_0, and turbo3 KV formats.
+> **Core idea:** shift KV cache optimization from compression to attention-aware computation.
 
-**Working end-to-end** — Qwen 3.5 35B-A3B MoE with 3-bit TurboQuant KV cache on M5 Max via llama.cpp Metal.
+~1% perplexity increase vs q8_0 due to compression; sparse V introduces no measurable additional degradation. Sparse V ON/OFF delta = 0.000 across all tested contexts and formats.
+
+**Not TurboQuant-specific** — validated across q8_0, q4_0, and turbo3 KV formats.
+
+Validated end-to-end on Qwen 3.5 35B-A3B (MoE) on M5 Max via llama.cpp Metal.
 
 ## Status: v1 Complete, Speed Optimized, Community-Tested
 
@@ -114,7 +118,7 @@ Tested using [Kamradt](https://github.com/gkamradt/LLMTest_NeedleInAHaystack) an
 |------|------|--------|-------------------|
 | Single needle (9 positions) | 7/9 | 7/9 | **9/9 (100%)** |
 
-turbo3 + sparse V achieves 9/9 in this setup (vs 7/9 baseline), suggesting possible denoising effects from removing low-weight quantization noise. Needle positions have meaningful attention weights (well above the 1e-6 threshold) and are never skipped.
+turbo3 + sparse V achieves 9/9 in this setup (vs 7/9 baseline), suggesting a potential denoising effect from removing low-weight quantization noise. Needle positions have meaningful attention weights (well above the 1e-6 threshold) and are never skipped.
 
 Sparse V shows no measurable impact on perplexity across all tested contexts and datasets. Observed improvements in retrieval tasks (e.g., NIAH) are treated as secondary signals and may reflect reduced quantization noise rather than fundamental model quality changes.
 
