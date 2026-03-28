@@ -87,6 +87,17 @@ Reference:
 turbo4 beats turbo3 by 20% on real-world server decode (63.7 vs 53.3).
 turbo4 server decode is 93% of q8_0 (63.7 / 68.2).
 
+=== DENSE MODEL (Qwen3.5-27B Q8_0) ===
+
+| Config | PPL (512) | Short decode | pp8192+tg128 | pp16384+tg128 |
+|--------|----------|-------------|-------------|--------------|
+| q8_0 | — | 17.17 tok/s | — | — |
+| turbo4 | 6.9378 | 17.25 tok/s | 304.70 | 320.72 |
+| turbo3 (ref) | — | 16.73 tok/s | 298.27 | 316.98 |
+
+turbo4 matches q8_0 on dense. Slightly faster than turbo3.
+No regressions — safe for dense models.
+
 Commands used:
   llama-perplexity ... -ctk turbo4 -ctv turbo4 -fa on --chunks 8 -ngl 99
   llama-bench ... -ctk turbo4 -ctv turbo4 -fa 1 -ngl 99
