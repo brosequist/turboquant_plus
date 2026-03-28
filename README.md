@@ -4,9 +4,11 @@ Implementation of [TurboQuant](https://research.google/blog/turboquant-redefinin
 
 > **Why "Plus"?** The base TurboQuant paper is v1. I have ideas for improvements coming post-v1 — adaptive bit allocation, temporal decay compression, expert-aware MoE compression, and more. The "plus" is what comes next.
 
-Compresses transformer KV cache **4.6x** using PolarQuant + Walsh-Hadamard rotation. Near q8_0 prefill speed and 0.90-0.93x decode throughput at long context on Apple Silicon.
+Compresses transformer KV cache **4.6x** using PolarQuant + Walsh-Hadamard rotation. Near q8_0 prefill speed and ~0.9x decode throughput at long context (Apple Silicon).
 
-**Key contribution:** Attention-gated KV cache decoding ("Sparse V") that skips low-weight V positions during inference. Up to +22.8% decode speed at 32K context with no measurable PPL change. This shifts KV cache optimization from representation-level compression to attention-aware computation, using the model's own sparsity to eliminate unnecessary work.
+**Key contribution:** Attention-gated KV cache decoding ("Sparse V") that skips low-weight V positions during inference. Up to +22.8% decode speed at 32K context with no measurable PPL change. Sparse V uses attention weights as a gating signal for computation, skipping work that contributes negligibly to the output. This shifts KV cache optimization from representation-level compression to attention-aware computation.
+
+~1% perplexity increase vs q8_0 due to compression; sparse V introduces no additional degradation. Validated at 32K context on wikitext-103 with 50 chunks (CI ±0.021): sparse V ON/OFF delta = 0.000. **Not TurboQuant-specific** — validated across q8_0, q4_0, and turbo3 KV formats.
 
 **Working end-to-end** — Qwen 3.5 35B-A3B MoE with 3-bit TurboQuant KV cache on M5 Max via llama.cpp Metal.
 
@@ -15,7 +17,7 @@ Compresses transformer KV cache **4.6x** using PolarQuant + Walsh-Hadamard rotat
 - 511+ Python tests, 100% code coverage on diagnostics
 - C port integrated into llama.cpp with Metal GPU kernels
 - `--cache-type-k turbo3 --cache-type-v turbo3` works on Apple Silicon
-- **q8_0 speed parity achieved** (2747 vs 2694 tok/s prefill)
+- **q8_0 prefill speed parity achieved** (2747 vs 2694 tok/s)
 - **Norm correction**: PPL beats q8_0 on CUDA (-1.17%), +1.1% on Metal (ported from @spiritbuun)
 - **4-mag LUT**: auto-detected on M1/M2/M3/M4, +38-45% decode at long context
 - **Layer-adaptive mode 2**: q8_0 quality at 3.5x compression (last 8 layers at q8_0)
@@ -73,7 +75,7 @@ Compresses transformer KV cache **4.6x** using PolarQuant + Walsh-Hadamard rotat
 
 Dense models see smaller gains (attention is <5% of decode — FFN dominates). No regressions. Safe to enable by default.
 
-**Sparse V dequant** skips V dequantization for positions where softmax attention weight < 1e-6. At long context, most attention weights are negligible — this saves approximately half the total dequant cost. +22.8% decode at 32K vs turbo3 without sparse V, pushing the ratio from 0.76x to 0.93x of q8_0. Sparse V introduces no additional PPL degradation beyond the underlying compression (validated at 32K with 50 chunks on wikitext-103, CI ±0.021). Benefit scales with context length. This is a 3-line kernel change.
+**Sparse V dequant** skips V dequantization for positions where softmax attention weight < 1e-6. At long context, most attention weights are negligible — this saves approximately half the total dequant cost. +22.8% decode at 32K vs turbo3 without sparse V, pushing the ratio from 0.76x to 0.93x of q8_0. Sparse V introduces no additional PPL degradation beyond the underlying compression (validated at 32K with 50 chunks on wikitext-103, CI ±0.021). Benefit scales with context length. This is implemented as a minimal kernel modification.
 
 Sparse V is not TurboQuant-specific: on q8_0 KV cache it yields a +5% decode speedup with identical PPL and NIAH, confirming this is a general attention-aware optimization rather than a compression-specific trick. See the [full paper](docs/papers/sparse-v-dequant.md).
 
