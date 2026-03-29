@@ -4,7 +4,7 @@ Implementation of [TurboQuant](https://research.google/blog/turboquant-redefinin
 
 > **Why "Plus"?** The base TurboQuant paper is v1. I have ideas for improvements coming post-v1 — adaptive bit allocation, temporal decay compression, expert-aware MoE compression, and more. The "plus" is what comes next.
 
-Compresses transformer KV cache **4.6x** using PolarQuant + Walsh-Hadamard rotation. Near q8_0 prefill speed and ~0.9x decode throughput at long context (Apple Silicon).
+Compresses transformer KV cache **4.6–6.4x** using PolarQuant + Walsh-Hadamard rotation. Near q8_0 prefill speed and ~0.9x decode throughput at long context (Apple Silicon). Full format family: turbo2 (2-bit, 6.4x), turbo3 (3-bit, 4.6x), turbo4 (4-bit, 3.8x).
 
 **Key contribution:** Attention-gated KV cache decoding ("Sparse V") that skips low-weight V positions during inference. up to +22.8% decode speed at 32K context, validated on wikitext-103 (50 chunks, CI ±0.021) with no measurable PPL change. Sparse V uses attention weights as a gating signal for computation, skipping work that contributes negligibly to the output.
 
@@ -20,7 +20,8 @@ Validated end-to-end on Qwen 3.5 35B-A3B (MoE) on M5 Max via llama.cpp Metal.
 
 - 511+ Python tests, 100% code coverage on diagnostics
 - C port integrated into llama.cpp with Metal GPU kernels
-- `--cache-type-k turbo3 --cache-type-v turbo3` works on Apple Silicon
+- `--cache-type-k turbo3 --cache-type-v turbo3` works on Apple Silicon (turbo2/turbo3/turbo4 all supported)
+- **turbo2 Metal support**: 2-bit, 6.4x compression, +6.48% PPL — for extreme memory pressure or asymmetric K/V
 - **q8_0 prefill speed parity achieved** (2747 vs 2694 tok/s)
 - **Norm correction**: PPL beats q8_0 on CUDA (-1.17%), +1.1% on Metal (ported from @spiritbuun)
 - **4-mag LUT**: auto-detected on M1/M2/M3/M4, +38-45% decode at long context
@@ -44,8 +45,9 @@ Validated end-to-end on Qwen 3.5 35B-A3B (MoE) on M5 Max via llama.cpp Metal.
 | **turbo4** | **4.25** | **3.8x** | **6.125** | **+0.23%** |
 | q4_0 | 4.5 | 3.6x | 6.142 | +0.52% |
 | turbo3 | 3.5 | 4.6x | 6.176 | +1.06% |
+| turbo2 | 2.5 | 6.4x | 6.507 | +6.48% |
 
-turbo4 (4-bit PolarQuant) has the best quality after q8_0 — closer to q8_0 than q4_0, at better compression. turbo3 trades quality for maximum compression.
+turbo4 (4-bit PolarQuant) has the best quality after q8_0 — closer to q8_0 than q4_0, at better compression. turbo3 trades quality for maximum compression. turbo2 (2-bit) trades more quality for extreme compression — best used asymmetrically (`-ctk turbo2 -ctv turbo3`).
 
 ### Prefill Context Scaling (Verified 2K-32K)
 
