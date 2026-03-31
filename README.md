@@ -187,7 +187,7 @@ PPL on real document (70-pages.md, ctx=512, 20 chunks): q8_0 16.29, turbo4 16.44
 
 ### Community Hardware: AMD RX 9070 XT (RDNA 4, gfx1201, Windows 11)
 
-First AMD GPU validation. Qwen2.5-7B Q4_K_M on HIP SDK 7.1. gfx1201 detected natively — no `HSA_OVERRIDE_GFX_VERSION` needed.
+First AMD GPU validation. First attempt — no debugging, no analysis, just raw testing out of the box. Qwen2.5-7B Q4_K_M on HIP SDK 7.1. gfx1201 detected natively — no `HSA_OVERRIDE_GFX_VERSION` needed.
 
 | K | V | PPL (wikitext-2) | vs q8_0 | Prefill t/s | Decode t/s | Status |
 |---|---|-----------------|---------|-------------|-----------|--------|
