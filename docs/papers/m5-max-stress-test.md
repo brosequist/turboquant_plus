@@ -8,19 +8,19 @@ GitHub: [@TheTom](https://github.com/TheTom)
 
 ## Abstract
 
-We stress-test TurboQuant KV cache compression on Meta's Llama-3.1-70B-Instruct (Q4_K_M, 40GB) running on a single Apple M5 Max with 128GB unified memory. This is the largest model tested with TurboQuant to date.
+We stress-test TurboQuant KV cache compression on Meta's Llama-3.1-70B-Instruct and CohereForAI Command-R+ 104B (both Q4_K_M) running on a single Apple M5 Max with 128GB unified memory. These are the largest models tested with TurboQuant to date.
 
 Key findings:
 
-1. **Llama-70B Q4_K_M tolerates symmetric turbo quantization.** Unlike Qwen2.5-7B Q4_K_M (catastrophic PPL 3500+ with symmetric turbo3), the 70B model handles all turbo configs without catastrophic failure. turbo4/turbo4 achieves +6.3% PPL vs q8_0, turbo3/turbo3 +11.4%.
+1. **104B at full 128K native context on a laptop.** Command-R+ 104B with turbo3/turbo3 achieves PPL 4.024 at 128K context, using ~74GB of 128GB. 5.12x KV compression.
 
-2. **turbo3 prefill is faster than q8_0 at 32K context.** 80.8 t/s vs 75.2 t/s (+7.4%). At long context, the KV cache is large enough that turbo3's reduced memory bandwidth outweighs its dequantization cost.
+2. **Larger models tolerate symmetric turbo better.** 104B turbo3/turbo3 is +3.6% PPL (vs +11.4% on 70B). turbo4/turbo4 is +1.9%, nearly lossless.
 
-3. **48K context confirmed on a laptop.** 70B at 48K context with turbo3/turbo3 achieves PPL 4.019, using 44GB of 128GB. 61GB remains free.
+3. **turbo3 prefill is faster than q8_0 at 32K context.** Consistent on both 70B (80.8 vs 75.2 t/s, +7.4%) and 104B (64.5 vs 62.3 t/s, +3.5%). Smaller KV cache = less memory bandwidth.
 
-4. **NIAH retrieval is perfect.** 30/30 single-needle retrieval across 5 depths × 3 context lengths × 2 cache types. Zero difference between q8_0 and turbo3.
+4. **NIAH retrieval is perfect.** 30/30 on 70B (q8_0 and turbo3). 10/10 on 104B turbo3 at 4K/8K.
 
-5. **Hard context wall at ~49K.** Both q8_0 and turbo3 hang at 50K+ context. This is a Metal backend limitation, not a TurboQuant issue.
+5. **macOS context wall identified and fixed.** The default `iogpu.wired_limit_mb` caps GPU memory at ~75% of RAM. On 128GB, this causes Metal to stall at ~49K context on 70B+ models. Fix: `sudo sysctl iogpu.wired_limit_mb=122880`. One command, no reboot.
 
 All tests used Metal flash attention with full GPU offload. Block size 128 throughout (5.12x compression for turbo3).
 
@@ -172,7 +172,9 @@ Kamradt single-needle methodology. 5 depths (0%, 25%, 50%, 75%, 100%) × 3 conte
 
 With turbo3, the KV cache at 48K is 3GB instead of 8GB. Both fit comfortably in 128GB with 60+ GB to spare.
 
-### 5.2 Context Wall
+### 5.2 Context Wall (Identified and Fixed)
+
+Without the fix, both q8_0 and turbo3 hang at 50K+ context:
 
 | K | V | Context | Status |
 |---|---|---------|--------|
@@ -182,9 +184,24 @@ With turbo3, the KV cache at 48K is 3GB instead of 8GB. Both fit comfortably in 
 | turbo3 | turbo3 | 56K | **HANGS** |
 | q8_0 | q8_0 | 64K | **HANGS** |
 
-Both q8_0 and turbo3 hang at 50K+ context. The hang occurs after model loading and KV allocation but before the first computation batch. Memory is not the bottleneck (61GB free at 48K).
+**Root cause:** macOS sets `recommendedMaxWorkingSetSize` to ~75% of physical RAM by default. On 128GB, this is ~96GB. When total GPU allocations (model + KV + compute buffers) exceed this limit, Metal's buffer allocation blocks indefinitely.
 
-This is a Metal backend limitation, not a TurboQuant issue. Preliminary investigation points to Metal compute buffer allocation or residency set handling for large context windows on 70B-class models. See [[TurboQuant - Metal 70B Context Wall Research]] for the full investigation.
+**Fix:** One command, no reboot required:
+
+```bash
+# 128GB Mac
+sudo sysctl iogpu.wired_limit_mb=122880
+
+# 96GB Mac
+sudo sysctl iogpu.wired_limit_mb=92160
+
+# 64GB Mac
+sudo sysctl iogpu.wired_limit_mb=61440
+```
+
+With the fix applied, 70B runs at 64K context (PPL 4.135). See Section 8 for 104B results at 128K.
+
+Isolation experiments confirmed `iogpu.wired_limit_mb` is the sole fix needed. `GGML_METAL_NO_RESIDENCY=1` and custom ubatch sizes had no measurable effect.
 
 ---
 
@@ -210,35 +227,119 @@ On models without GQA (e.g., GPT-class with n_kv_heads = n_heads), TurboQuant's 
 | Qwen2.5-1.5B | Q4_K_M | 8,641 | catastrophic |
 | Mistral-24B | Q4_K_M | 4.987 | healthy |
 | **Llama-70B** | **Q4_K_M** | **3.629** | **healthy** |
+| **Command-R+ 104B** | **Q4_K_M** | **6.415** | **healthy** |
 
-The Q4_K_M symmetric turbo sensitivity appears to be model-family-dependent, not purely size-dependent. Qwen2.5 is sensitive at all sizes. Mistral and Llama tolerate it. For sensitive models, asymmetric q8_0-K + turbo-V is the recommended path.
+The Q4_K_M symmetric turbo sensitivity appears to be model-family-dependent, not purely size-dependent. Qwen2.5 is sensitive at all sizes. Mistral, Llama, and Command-R+ tolerate it. Larger models show better tolerance (104B +3.6% vs 70B +11.4%). For sensitive models, asymmetric q8_0-K + turbo-V is the recommended path.
 
 ---
 
-## 8. Upcoming: Command-R+ 104B Q4_K_M
+## 8. Command-R+ 104B Q4_K_M
 
-Testing in progress. Command-R+ 104B (~60GB weights) will be run with two Metal configuration changes that the 70B test did NOT have:
+### 8.1 Model
 
-1. `sudo sysctl iogpu.wired_limit_mb=122880` (increase GPU memory cap from default ~96GB to 120GB)
-2. `GGML_METAL_NO_RESIDENCY=1` (disable Metal residency sets, suspected cause of 50K+ hang)
+| Property | Value |
+|----------|-------|
+| Model | CohereForAI Command-R+ 104B |
+| Weight quantization | Q4_K_M (~59GB on disk, 58.4 GiB loaded) |
+| Layers | 64 |
+| Attention heads | 96 |
+| KV heads | 8 (GQA 12:1) |
+| Head dimension | 128 |
+| Native context | 128K |
 
-These changes allow a direct comparison: if the 104B test pushes past the 49K context wall that blocked the 70B test, the residency set fix is validated. Results will be added to this document.
+Metal configuration: `iogpu.wired_limit_mb=122880` applied before testing.
+
+### 8.2 Perplexity (512 tokens, 20 chunks, wikitext-2-raw)
+
+| K | V | PPL | vs q8_0 | Status |
+|---|---|-----|---------|--------|
+| q8_0 | q8_0 | 6.192 | baseline | healthy |
+| q8_0 | turbo4 | 6.211 | +0.3% | healthy |
+| q8_0 | turbo3 | 6.296 | +1.7% | healthy |
+| q8_0 | turbo2 | 6.678 | +7.9% | healthy |
+| turbo4 | turbo4 | 6.312 | +1.9% | healthy |
+| turbo3 | turbo3 | 6.415 | +3.6% | healthy |
+| turbo2 | turbo2 | 7.049 | +13.8% | usable |
+
+**104B tolerates symmetric turbo even better than 70B.** turbo3/turbo3 is +3.6% (vs +11.4% on 70B). turbo4/turbo4 is nearly lossless at +1.9%. Bigger models = more headroom for quantization stacking.
+
+### 8.3 Speed
+
+#### 512 Context
+
+| K | V | Prefill (t/s) | Decode (t/s) |
+|---|---|:-------------:|:------------:|
+| q8_0 | q8_0 | 125.0 | 8.5 |
+| q8_0 | turbo4 | 128.5 | 7.6 |
+| q8_0 | turbo3 | 129.4 | 7.3 |
+| q8_0 | turbo2 | 127.3 | 7.8 |
+| turbo4 | turbo4 | 118.0 | 7.9 |
+| turbo3 | turbo3 | 125.7 | 6.8 |
+| turbo2 | turbo2 | 126.5 | 7.7 |
+
+#### 8K Context
+
+| K | V | Prefill (t/s) | Decode (t/s) |
+|---|---|:-------------:|:------------:|
+| q8_0 | q8_0 | 101.6 | 7.6 |
+| q8_0 | turbo3 | 100.1 | 8.1 |
+| turbo3 | turbo3 | 98.4 | 7.6 |
+
+#### 32K Context
+
+| K | V | Prefill (t/s) | Decode (t/s) |
+|---|---|:-------------:|:------------:|
+| q8_0 | q8_0 | 62.3 | 8.3 |
+| turbo3 | turbo3 | 64.5 | 7.8 |
+
+turbo3 prefill faster than q8_0 again at 32K (64.5 vs 62.3 t/s, +3.5%). Same crossover pattern as 70B.
+
+### 8.4 Context Scaling (the big test)
+
+| K | V | Context | PPL | Pass time | Status |
+|---|---|---------|-----|-----------|--------|
+| turbo3 | turbo3 | 48K | 3.672 | 931s | works |
+| turbo3 | turbo3 | 64K | 4.321 | 1481s | works |
+| turbo3 | turbo3 | 96K | 4.170 | 2966s | works |
+| turbo3 | turbo3 | 128K | 4.024 | 4996s | **works** |
+
+**104 billion parameters. 128K full native context. On a MacBook. PPL 4.024.** turbo3 (5.12x KV compression). Peak memory ~74GB of 128GB. Pass time 83 minutes.
+
+The context wall that blocked 70B at 49K is fully resolved with `iogpu.wired_limit_mb=122880`.
+
+### 8.5 NIAH (Needle-In-A-Haystack)
+
+Kamradt single-needle methodology. 104B decode is slow (~8 t/s), so 16K tests timed out.
+
+#### turbo3 (5.12x compression)
+
+| Depth | 4K | 8K | 16K |
+|-------|:--:|:--:|:---:|
+| 0% | PASS | PASS | timeout |
+| 25% | PASS | PASS | — |
+| 50% | PASS | PASS | — |
+| 75% | PASS | PASS | — |
+| 100% | PASS | PASS | — |
+
+**10/10 pass at 4K and 8K.** 16K timed out due to slow decode, not a retrieval failure.
 
 ---
 
 ## 9. Limitations
 
-1. **Single model tested.** These results are for Llama-3.1-70B-Instruct Q4_K_M only. Other 70B models (Qwen-72B, DeepSeek-67B) may behave differently.
+1. **Two models tested.** Results are for Llama-3.1-70B-Instruct and Command-R+ 104B, both Q4_K_M. Other 70B+ models (Qwen-72B, DeepSeek-67B) may behave differently.
 
 2. **Q4_K_M weights only.** Q8_0 weights on 70B would likely show even better turbo PPL, but require ~70GB for weights alone, leaving limited room for KV cache on 128GB.
 
 3. **Metal only.** CUDA and HIP backends were not tested at this model size.
 
-4. **Context limited to 48K.** The 50K+ hang prevents testing at the model's native 128K context.
+4. **Single run per config.** PPL measurements are single-run, not averaged across multiple seeds. Error bars are from the wikitext-2 chunk variance, not run-to-run variance.
 
-5. **Single run per config.** PPL measurements are single-run, not averaged across multiple seeds. Error bars are from the wikitext-2 chunk variance, not run-to-run variance.
+5. **Boundary V not tested.** The auto-enable for turbo2-V was added after this test. Boundary V on 70B turbo2 would likely recover significant quality from the +58.5% degradation.
 
-6. **Boundary V not tested.** The auto-enable for turbo2-V was added after this test. Boundary V on 70B turbo2 would likely recover significant quality from the +58.5% degradation.
+6. **104B NIAH limited.** 16K context timed out due to slow decode (~8 t/s). Not a retrieval failure. Requires longer query timeout for full coverage.
+
+7. **macOS GPU memory fix required for 70B+ at long context.** The `iogpu.wired_limit_mb` sysctl must be set to ~95% of physical RAM. Resets on reboot.
 
 ---
 
