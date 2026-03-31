@@ -189,19 +189,24 @@ Without the fix, both q8_0 and turbo3 hang at 50K+ context:
 **Fix:** One command, no reboot required:
 
 ```bash
+# Recommended: 90% of physical RAM (safe for sustained inference)
+# Setting above 90% risks kernel panics under sustained load.
+
 # 128GB Mac
-sudo sysctl iogpu.wired_limit_mb=122880
+sudo sysctl iogpu.wired_limit_mb=117964
 
 # 96GB Mac
-sudo sysctl iogpu.wired_limit_mb=92160
+sudo sysctl iogpu.wired_limit_mb=88474
 
 # 64GB Mac
-sudo sysctl iogpu.wired_limit_mb=61440
+sudo sysctl iogpu.wired_limit_mb=58982
 ```
 
 With the fix applied, 70B runs at 64K context (PPL 4.135). See Section 8 for 104B results at 128K.
 
 Isolation experiments confirmed `iogpu.wired_limit_mb` is the sole fix needed. `GGML_METAL_NO_RESIDENCY=1` and custom ubatch sizes had no measurable effect.
+
+> **Note:** The original stress tests used 122880 (96%) without issues, but community testing (@treblewoe) reports kernel panics at sustained load above 90%. 90% is the recommended safe default.
 
 ---
 

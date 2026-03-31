@@ -170,7 +170,17 @@ Long context PPL (turbo3/turbo3, wikitext-2-raw):
 | 96K | 4.170 | 2966s |
 | 128K | 4.024 | 4996s |
 
-**128K full native context achieved** with `sudo sysctl iogpu.wired_limit_mb=122880` (raises macOS GPU memory cap from default ~75% to ~95% of physical RAM). Peak memory 74 GB of 128 GB.
+**128K full native context achieved** by raising macOS GPU memory cap from default ~75% of physical RAM. Recommended setting is 90% to avoid kernel panics under sustained load. Peak memory 74 GB of 128 GB.
+
+```bash
+# Recommended: 90% of physical RAM (safe for sustained inference)
+# 128GB Mac
+sudo sysctl iogpu.wired_limit_mb=117964
+# 96GB Mac
+sudo sysctl iogpu.wired_limit_mb=88474
+# 64GB Mac
+sudo sysctl iogpu.wired_limit_mb=58982
+```
 
 NIAH: 10/10 perfect at 4K and 8K (turbo3). 16K timed out due to slow decode on 104B, not retrieval failure.
 
@@ -319,6 +329,6 @@ See [block size study](papers/block-size-experiment.md) for the full data.
 - **Model sensitivity varies:** Qwen2.5 is consistently sensitive to symmetric turbo on Q4_K_M. Llama, Mistral, and Qwen3.5 tolerate it. Test before deploying on new model families.
 - **turbo2 as V cache:** turbo2-V with Boundary V auto-enabled gives +5-9.5% PPL depending on model. Boundary V recovers 37-91% of the quality gap.
 - **PPL is measured at 512 context with 4 chunks unless noted.** Long-context PPL validated up to 128K on Command-R+ 104B.
-- **104B at 128K context:** Confirmed on M5 Max 128GB with Command-R+ Q4_K_M. turbo3/turbo3 PPL 4.024. Requires `sudo sysctl iogpu.wired_limit_mb=122880` to raise macOS GPU memory cap from default ~75% to ~95% of physical RAM. Without this, Metal hangs at ~49K context on 70B+ models. `GGML_METAL_NO_RESIDENCY=1` is not needed (isolation testing confirmed). See [M5 Max stress test](papers/m5-max-stress-test.md).
+- **104B at 128K context:** Confirmed on M5 Max 128GB with Command-R+ Q4_K_M. turbo3/turbo3 PPL 4.024. Requires raising macOS GPU memory cap: `sudo sysctl iogpu.wired_limit_mb=117964` (90% of 128GB, safe for sustained inference). Without this, Metal hangs at ~49K context on 70B+ models. Setting above 90% risks kernel panics under sustained load (community reported). `GGML_METAL_NO_RESIDENCY=1` is not needed (isolation testing confirmed). See [M5 Max stress test](papers/m5-max-stress-test.md).
 - **turbo3 prefill faster than q8_0 at 32K:** Confirmed on both 70B (+7.4%) and 104B (+3.5%). Smaller KV cache reduces memory bandwidth during attention.
 - **Community:** 30+ testers across M1/M2/M3/M5 Mac, RTX 3080 Ti/3090/4090/5090, DGX Spark Blackwell, AMD RX 9070 XT.
