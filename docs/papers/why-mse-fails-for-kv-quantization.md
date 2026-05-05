@@ -479,5 +479,4 @@ Full ledger of all 35 hypotheses (including the EDEN-arc H1–H7, secondary fitt
 - Companion paper (algorithmic claim): [eden-optimal-s-revisit.md](./eden-optimal-s-revisit.md)
 - Issue #87 (Mitzenmacher): [TheTom/turboquant_plus#87](https://github.com/TheTom/turboquant_plus/issues/87)
 - Issue #89 (Portnoy): [TheTom/turboquant_plus#89](https://github.com/TheTom/turboquant_plus/issues/89)
-- Experiment scripts: `scripts/eden-investigation/` in this repo (h*.py, f1–f3 KL test, universal-K candidate centroids)
 - Related work (cited if developed further): KIVI (Liu et al., 2024), HIGGS, SmoothQuant (Xiao et al.), OmniQuant, GPTQ
