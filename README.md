@@ -478,7 +478,15 @@ Input: KV cache vector x ∈ R^d (one attention head)
         Compression: 3.8x (turbo4), 5.1x (turbo3), 7.5x (turbo2)
 ```
 
-> **Note on QJL:** The original paper uses a 1-bit QJL error correction step. We dropped it — QJL increases variance which softmax amplifies, hurting quality. More centroids (PolarQuant-only) beats MSE + QJL split. Confirmed independently by 5 groups.
+> **Note on QJL: reference only, not used in production.**
+>
+> The original TurboQuant paper (Zandieh et al. 2024, [arXiv 2406.03482](https://arxiv.org/abs/2406.03482)) includes a 1-bit QJL error-correction stage. The Python `qjl.py` here implements it for paper reproducibility.
+>
+> **Production drops QJL on both K and V.** [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) recommended config is `--cache-type-k q8_0 --cache-type-v turbo3`. No QJL on either side.
+>
+> QJL eliminates reconstruction bias but amplifies variance, which softmax turns into attention noise. Five independent groups confirmed (buun, scos-lab, Arclabs001, +2). See [turbo4-resurrection.md](docs/papers/turbo4-resurrection.md) for the full ablation and mechanism.
+>
+> If you're building on this repo: use `TurboQuantMSE` (V cache), or implement straight 4 to 8 bit PolarQuant on K. Only enable the `QJL` / `TurboQuant` (with QJL) classes if you are reproducing the original paper or doing K-side research below 8-bit. Even then, validate at your target context length. Historical evidence is that QJL noise accumulates past ~16K context.
 
 ## Project Structure
 
@@ -487,7 +495,7 @@ turboquant/
 ├── rotation.py        # Walsh-Hadamard Transform + random sign flips
 ├── codebook.py        # Lloyd-Max optimal centroid computation
 ├── polar_quant.py     # PolarQuant — norm extraction + WHT rotation + scalar quantization
-├── qjl.py            # QJL 1-bit quantizer (kept for reference, not used in production)
+├── qjl.py            # QJL 1-bit quantizer (paper-faithful reference, see README §QJL). Not used by TheTom/llama-cpp-turboquant in production.
 ├── turboquant.py      # Full TurboQuant pipeline
 ├── kv_cache.py        # KV cache integration layer
 ├── outlier.py         # Outlier channel strategy (2.5-bit, 3.5-bit)

@@ -186,11 +186,16 @@ class TurboQuant:
             bit_width=self.bit_width,
         )
 
-    def dequantize(self, compressed: CompressedVector) -> np.ndarray:
+    def dequantize(self, compressed: CompressedVector, shrinkage: float = 1.0) -> np.ndarray:
         """Dequantize back to approximate vector.
 
         Args:
             compressed: CompressedVector from quantize().
+            shrinkage: Multiplicative factor applied to the QJL stage.
+                Default ``1.0`` is the classical unbiased estimator
+                (paper-faithful, backward-compatible). MMSE-optimal is
+                ``2/np.pi ≈ 0.6366`` — see ``QJL.dequantize`` for the
+                derivation.
 
         Returns:
             Reconstructed vector(s), same shape as original.
@@ -199,7 +204,9 @@ class TurboQuant:
         x_mse = self.polar_quant.dequantize(compressed.mse_indices, compressed.vector_norms)
 
         # Stage 2: QJL residual reconstruction
-        x_qjl = self.qjl.dequantize(compressed.qjl_signs, compressed.residual_norms)
+        x_qjl = self.qjl.dequantize(
+            compressed.qjl_signs, compressed.residual_norms, shrinkage=shrinkage
+        )
 
         return x_mse + x_qjl
 
