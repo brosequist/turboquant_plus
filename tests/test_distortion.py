@@ -157,18 +157,21 @@ class TestDistortionScaling:
         )
 
     def test_turboquant_improves_over_polarquant(self):
-        """TurboQuant (QJL variant) raw IP error should not exceed PolarQuant 1-bit alone.
+        """Regression guard: PolarQuant 2-bit (MSE-only) should beat TurboQuant 2-bit (QJL).
 
-        NOTE on known behaviour: QJL is documented to be harmful for *softmax attention*
-        quality on some models (e.g. Qwen2.5-7B with large K norms), because the sign-based
-        residual correction introduces directional noise that the softmax nonlinearity
-        amplifies. See docs/papers/turbo4-resurrection.md for the full analysis.
+        The *current* finding (despite the historical test name) is that the 1-bit QJL
+        residual stage is counterproductive for raw inner-product distortion at a fixed bit
+        budget. With the current QJL implementation (random orthogonal projection + √d
+        scaling, see turboquant/qjl.py), QJL adds directional noise rather than improving the
+        IP estimate, so at a 2-bit total budget PolarQuant-only (MSE) beats PolarQuant-1bit +
+        QJL-1bit. This mirrors the documented softmax-attention regression on large-K-norm
+        models (e.g. Qwen2.5-7B) in docs/papers/turbo4-resurrection.md (issue #45); the
+        production path (TurboQuantMSE) omits QJL entirely.
 
-        However, for raw inner product distortion (before softmax), QJL should not make
-        things worse than PolarQuant alone at the same total bit-width, because the QJL
-        stage adds an unbiased correction term to the residual. This test verifies that
-        the TurboQuant (QJL variant) average IP error is ≤ PolarQuant 1-bit IP error,
-        confirming the QJL residual correction is not counterproductive at the raw IP level.
+        The guard asserts PolarQuant-2bit avg IP error ≤ TurboQuant-2bit avg IP error against
+        the current QJL. If a future QJL revision flips this, the assertion fails on purpose,
+        prompting a re-evaluation of whether QJL should return to the production path.
+        (PolarQuant-1bit error is printed for context only and is not asserted on.)
         """
         d = 256
         rng = np.random.default_rng(111)

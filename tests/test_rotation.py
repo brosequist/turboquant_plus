@@ -194,7 +194,8 @@ class TestFastWalshHadamard:
             fast_walsh_hadamard_transform(np.array([1.0, 2.0, 3.0]))
 
     def test_hadamard_matrix_matches_scipy(self):
-        """Our hadamard_matrix should match scipy's."""
+        """Our hadamard_matrix should match scipy's (skipped if scipy unavailable)."""
+        pytest.importorskip("scipy")
         from turboquant.rotation import hadamard_matrix
         from scipy.linalg import hadamard as scipy_hadamard
 
@@ -207,8 +208,9 @@ class TestFastWalshHadamard:
         """FWHT should match scipy's Hadamard matrix multiply (normalized).
 
         Codex review: use independent reference (scipy) not our own hadamard_matrix
-        to avoid shared-source risk.
+        to avoid shared-source risk. Skipped if scipy is unavailable.
         """
+        pytest.importorskip("scipy")
         from turboquant.rotation import fast_walsh_hadamard_transform
         from scipy.linalg import hadamard as scipy_hadamard
 
